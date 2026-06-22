@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
+<iq:manifest xmlns:iq="http://www.garmin.com/xml/connectiq" version="3">
+    <!--
+      Lullhum bilateral vibration watch app.
+      App id MUST match the IQApp UUID used by the Android companion.
+    -->
+    <iq:application
+        entry="LullhumApp"
+        id="f1e2d3c4b5a697887766554433221100"
+        launcherIcon="@Drawables.LauncherIcon"
+        minApiLevel="3.4.0"
+        name="@Strings.AppName"
+        type="watch-app">
+        <iq:products>
+            <iq:product id="venu3" />
+        </iq:products>
+        <iq:permissions>
+            <iq:uses-permission id="Communications" />
+        </iq:permissions>
+        <iq:languages>
+            <iq:language>eng</iq:language>
+        </iq:languages>
+    </iq:application>
+</iq:manifest>
