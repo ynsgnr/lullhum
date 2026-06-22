@@ -1,6 +1,8 @@
 import Toybox.Lang;
+using Toybox.Application.Storage;
 
 // Shared, mutable settings chosen on the config screens and read by the controller.
+// Selections persist across launches via Application.Storage.
 module Config {
 
     enum { MODE_ALTERNATING, MODE_INTERVAL, MODE_BREATHING }
@@ -31,7 +33,13 @@ module Config {
     var intervalIdx = 1;
 
     function intervalMs() as Number { return intervalOptions[intervalIdx] * 1000; }
+    function intervalSec() as Number { return intervalOptions[intervalIdx]; }
     function cycleInterval() as Void { intervalIdx = (intervalIdx + 1) % intervalOptions.size(); }
+
+    // Live intent to run the phone's background reminder (not persisted; the
+    // phone UI is the source of truth for whether it's actually running).
+    var phoneReminderOn = false;
+    function phoneReminderLabel() as String { return phoneReminderOn ? "On" : "Off"; }
     function intervalLabel() as String {
         var s = intervalOptions[intervalIdx];
         return s < 60 ? s.toString() + " sec" : (s / 60).toString() + " min";
@@ -51,5 +59,30 @@ module Config {
     }
     function customPhaseLabel(phase as Number) as String {
         return (customMs[phase] / 1000.0).format("%.1f") + " s";
+    }
+
+    // --- Persistence ---
+    function save() as Void {
+        Storage.setValue("mode", mode);
+        Storage.setValue("speedIdx", speedIdx);
+        Storage.setValue("durationIdx", durationIdx);
+        Storage.setValue("intervalIdx", intervalIdx);
+        Storage.setValue("presetIdx", presetIdx);
+        Storage.setValue("customMs", customMs);
+    }
+
+    function load() as Void {
+        mode = readInt("mode", mode);
+        speedIdx = readInt("speedIdx", speedIdx);
+        durationIdx = readInt("durationIdx", durationIdx);
+        intervalIdx = readInt("intervalIdx", intervalIdx);
+        presetIdx = readInt("presetIdx", presetIdx);
+        var cm = Storage.getValue("customMs");
+        if (cm instanceof Array) { customMs = cm as Array<Number>; }
+    }
+
+    function readInt(key, dflt) {
+        var v = Storage.getValue(key);
+        return (v instanceof Number) ? v : dflt;
     }
 }

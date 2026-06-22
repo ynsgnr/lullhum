@@ -22,9 +22,11 @@ import com.garmin.android.connectiq.IQDevice
  * Foreground service that keeps the Connect IQ listener alive and vibrates the
  * phone in alternation with the watch.
  *
- * The watch (Alternating mode) sends `{cmd:"start", speed:<ms>}` on start and
- * `{cmd:"stop"}` on stop. The phone vibrates on even intervals only, offset by
- * one full interval from the watch so the two devices strictly alternate.
+ * The watch (Alternating mode) sends `{cmd:"start", speed, anchor}` on start and
+ * `{cmd:"stop"}` on stop. The phone aligns its buzzes to the shared `anchor`
+ * wall-clock second, one interval behind the watch, so the two strictly
+ * alternate regardless of message latency. The background reminder lives in
+ * [Reminder] (AlarmManager-based) so it survives the service being killed.
  */
 class VibrationService : Service() {
 
@@ -38,6 +40,11 @@ class VibrationService : Service() {
 
         // Phone pulse length is capped so fast speeds stay crisp.
         private const val MAX_PULSE_MS = 200L
+
+        const val ACTION_START_REMINDER = "diy.hosted.lullhum.START_REMINDER"
+        const val ACTION_STOP_REMINDER = "diy.hosted.lullhum.STOP_REMINDER"
+        const val EXTRA_INTERVAL_MIN = "interval_min"
+        const val MIN_REMINDER_MIN = 5
     }
 
     private lateinit var connectIQ: ConnectIQ
@@ -65,13 +72,20 @@ class VibrationService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(NOTIFICATION_ID, buildNotification(statusText()))
+        startForeground(NOTIFICATION_ID, buildNotification())
+        when (intent?.action) {
+            ACTION_START_REMINDER ->
+                Reminder.start(this, intent.getIntExtra(EXTRA_INTERVAL_MIN, MIN_REMINDER_MIN))
+            ACTION_STOP_REMINDER -> Reminder.stop(this)
+        }
         return START_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        // Note: the reminder is intentionally NOT cancelled here — it's alarm-based
+        // and meant to keep buzzing the watch even if this service is killed.
         stopVibration()
         unregisterDevices()
         if (sdkReady) {
@@ -148,9 +162,15 @@ class VibrationService : Service() {
                 when (item["cmd"] as? String) {
                     "start" -> {
                         val speed = (item["speed"] as? Number)?.toInt() ?: 500
-                        startVibration(speed)
+                        val anchorSec = (item["anchor"] as? Number)?.toLong() ?: 0L
+                        startVibration(speed, anchorSec)
                     }
                     "stop" -> stopVibration()
+                    "reminderStart" -> {
+                        val sec = (item["intervalSec"] as? Number)?.toInt() ?: (MIN_REMINDER_MIN * 60)
+                        Reminder.start(this, sec / 60)
+                    }
+                    "reminderStop" -> Reminder.stop(this)
                 }
             }
         }
@@ -173,9 +193,9 @@ class VibrationService : Service() {
 
     private fun isVibrating() = vibrateRunnable != null
 
-    private fun startVibration(speedMs: Int) {
+    private fun startVibration(speedMs: Int, anchorSec: Long) {
         stopVibration()
-        val period = (2L * speedMs)
+        val period = 2L * speedMs
         val pulse = minOf(speedMs.toLong(), MAX_PULSE_MS)
 
         val runnable = object : Runnable {
@@ -185,12 +205,21 @@ class VibrationService : Service() {
             }
         }
         vibrateRunnable = runnable
-        // First phone buzz one full interval after the watch's first buzz
-        // (watch buzzes at t=speed, phone at t=2*speed), then every 2*speed.
-        handler.postDelayed(runnable, period)
+        handler.postDelayed(runnable, firstBuzzDelay(anchorSec, speedMs.toLong(), period))
 
         LullhumState.set(Status.RUNNING)
         updateNotification()
+    }
+
+    // Phone buzzes one interval after the watch's anchor buzz, then every 2*speed.
+    // Aligning to the shared wall-clock anchor keeps the two interleaved despite
+    // BLE latency; if the anchor already passed, skip to the next valid slot.
+    private fun firstBuzzDelay(anchorSec: Long, speedMs: Long, period: Long): Long {
+        if (anchorSec <= 0) return period
+        val now = System.currentTimeMillis()
+        var first = anchorSec * 1000L + speedMs
+        while (first < now + 30) first += period
+        return first - now
     }
 
     private fun stopVibration() {
@@ -209,33 +238,24 @@ class VibrationService : Service() {
 
     // ---- Notification / status ---------------------------------------------
 
-    private fun statusText(): String = when (LullhumState.status.value) {
-        Status.RUNNING -> "Running"
-        Status.STOPPED -> "Connected"
-        Status.DISCONNECTED -> "Waiting for watch"
-    }
-
     private fun createNotificationChannel() {
-        val channel = NotificationChannel(
-            CHANNEL_ID,
-            "Lullhum status",
-            NotificationManager.IMPORTANCE_LOW
-        ).apply { description = "Keeps Lullhum listening for the watch" }
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.createNotificationChannel(channel)
+        // The reminder channel is created lazily by Reminder.
+        getSystemService(NotificationManager::class.java).createNotificationChannel(
+            NotificationChannel(CHANNEL_ID, "Lullhum status", NotificationManager.IMPORTANCE_LOW)
+                .apply { description = "Keeps Lullhum listening for the watch" }
+        )
     }
 
-    private fun buildNotification(text: String): Notification {
-        return Notification.Builder(this, CHANNEL_ID)
+    private fun buildNotification(): Notification =
+        Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("Lullhum")
-            .setContentText(text)
+            .setContentText(LullhumState.status.value.label)
             .setSmallIcon(R.mipmap.ic_launcher)
             .setOngoing(true)
             .build()
-    }
 
     private fun updateNotification() {
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.notify(NOTIFICATION_ID, buildNotification(statusText()))
+        getSystemService(NotificationManager::class.java)
+            .notify(NOTIFICATION_ID, buildNotification())
     }
 }

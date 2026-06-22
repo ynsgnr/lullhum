@@ -4,27 +4,30 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-/** Connection / activity status surfaced to the UI by [VibrationService]. */
-enum class Status {
-    /** SDK not ready or Garmin Connect Mobile unavailable. */
-    DISCONNECTED,
-
-    /** Connected to the watch, waiting for a start message. */
-    STOPPED,
-
-    /** Received a start message; vibrating on even intervals. */
-    RUNNING,
+/** Connection / activity status, shown in both the UI and the notification. */
+enum class Status(val label: String) {
+    DISCONNECTED("Waiting for watch"),
+    STOPPED("Connected"),
+    RUNNING("Running"),
 }
 
-/**
- * Process-wide state bridge between the foreground [VibrationService] and the
- * Compose UI. The UI has no controls — it only observes this.
- */
+/** Process-wide state bridge from [VibrationService] / [Reminder] to the UI. */
 object LullhumState {
     private val _status = MutableStateFlow(Status.DISCONNECTED)
     val status: StateFlow<Status> = _status.asStateFlow()
 
+    private val _reminderActive = MutableStateFlow(false)
+    val reminderActive: StateFlow<Boolean> = _reminderActive.asStateFlow()
+
+    private val _reminderIntervalMin = MutableStateFlow(15)
+    val reminderIntervalMin: StateFlow<Int> = _reminderIntervalMin.asStateFlow()
+
     fun set(status: Status) {
         _status.value = status
+    }
+
+    fun setReminder(active: Boolean, intervalMin: Int) {
+        _reminderActive.value = active
+        _reminderIntervalMin.value = intervalMin
     }
 }

@@ -8,6 +8,7 @@ class LullhumApp extends Application.AppBase {
 
     function initialize() {
         AppBase.initialize();
+        Config.load();
         mController = new VibrationController();
     }
 
@@ -22,8 +23,10 @@ class LullhumApp extends Application.AppBase {
         mController.stop();
     }
 
+    // Launch straight into the running screen; it auto-starts with the saved
+    // selection. Settings are reachable from there via the menu button.
     function getInitialView() {
-        return [ new ModeMenu(), new ModeDelegate() ];
+        return [ new RunningView(), new RunningDelegate() ];
     }
 }
 

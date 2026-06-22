@@ -12,11 +12,25 @@ Foreground Simple App with three modes:
 
 | Mode | Phone? | Behaviour |
 |------|--------|-----------|
-| **Alternating** | yes | Watch buzzes on odd intervals, phone on even — strict alternation. Speed slow/medium/fast (1000/500/250 ms per side), duration 5/10/15/30 min or unlimited. Sends `{cmd:"start", speed}` / `{cmd:"stop"}` to the phone. If the phone connection drops, the watch keeps its own intervals. |
+| **Alternating** | yes | Watch and phone strictly alternate. To stay interleaved despite BLE latency, the watch picks the next whole wall-clock second as a shared anchor and sends `{cmd:"start", speed, anchor}`; both start there (watch on the anchor, phone one interval behind). Speed slow/medium/fast (1000/500/250 ms per side), duration 5/10/15/30 min or unlimited. Sends `{cmd:"stop"}` to end. If the phone drops, the watch keeps its own intervals. |
 | **Interval** | no | One `Attention.vibrate()` pulse every 2s…30min. Runs until stopped. |
-| **Breathing** | no | Vibrates during inhale/exhale, silent during holds. Presets: **A** physiological sigh (2000/1000/0/8000/2000 ms), **B** 4-7-8 (4000/7000/8000/0 ms), **C** custom per-phase. Runs until stopped. |
+| **Longer Interval w/ Phone** | yes | One `Attention.vibrate()` pulse every 2s…30min. Also starts a background service that periodically sends a notification in the Android app. Runs until stopped. |
+| **Breathing** | no | At each stage change, plays a distinct binary on/off motif once (250 ms per slot) so the stages are easy to tell apart: inhale `-.-.`, exhale `--..`, holds `-..=`. Presets: **A** breathing sigh (2000/1000/0/8000/2000 ms), **B** 4-7-8 (4000/7000/8000/0 ms), **C** custom per-phase. |
 
-UI flow: **Mode select → config (cycle values in place) → running screen** (SELECT/tap = start/stop, BACK = stop + exit).
+### Behaviour & controls
+
+- **Launches straight into the running screen** and auto-starts with your last-used
+  mode and settings (persisted via `Application.Storage`).
+- **Select button / screen tap** — pause ⇄ resume.
+- **Menu button** — open settings (mode + parameters). Changes persist and apply
+  live; vibration keeps running underneath while the menu is open. Each mode's
+  settings has a **Done** row that returns to the running screen and starts.
+- **Back** — exit.
+
+> **Background:** as a foreground Connect IQ app it keeps vibrating with the screen
+> off or while a menu is open, but **not** once you exit to the watch face — the
+> platform offers no API for continuous background haptics. (The Android companion,
+> being a foreground service, is unaffected.)
 
 ### Build
 
@@ -36,17 +50,42 @@ cd garmin
 Run in the simulator with `monkeydo bin/lullhum.prg venu3`, or sideload the
 `.prg` to a watch via Garmin Express / the device's `GARMIN/APPS` folder.
 
-> The build currently succeeds (`BUILD SUCCESSFUL`). The container-access
-> warnings from strict type checking are harmless.
+> The build succeeds clean (`BUILD SUCCESSFUL`, no warnings).
 
 ## Component 2 — Android companion (`app/`)
 
-Single status-only screen (Running / Connected / Waiting for watch) — there are
-no controls; everything is driven by the watch. A foreground service
-(`VibrationService`) keeps the Connect IQ listener alive with a persistent
-notification, listens for watch messages, and on `start` vibrates on even
-intervals only (offset one full interval from the watch). On `stop` or a
-dropped connection it cancels the timer.
+Status indicator (Running / Connected / Waiting for watch) plus a background
+interval reminder. A foreground service (`VibrationService`) keeps the Connect IQ
+listener alive with a persistent notification, listens for watch messages, and on
+`start` vibrates on even intervals only (offset one full interval from the watch).
+On `stop` or a dropped connection it cancels the timer.
+
+### Background reminder
+
+The one way to buzz the watch while the Connect IQ app is **closed**: the phone
+posts a fresh high-importance notification every N minutes, which Garmin Connect
+relays to the watch as a vibration. Each tick cancels the previous notification
+and posts a new id so the watch re-alerts without the list piling up.
+
+Scheduled with `AlarmManager.setAndAllowWhileIdle` (see `Reminder.kt` +
+`ReminderReceiver`), not an in-process timer: it fires during Doze, lets the CPU
+sleep between ticks (no wakelock, system-batched — battery-friendly), and each
+fire chains the next, so it survives the service being killed. The trade-off is
+inexact timing (may drift a few minutes in deep Doze), fine for a multi-minute
+reminder.
+
+- **Minimum 5 minutes** (the relay throttles anything faster; sub-minute pinging
+  isn't reliable, and it can't express custom haptic patterns — only a plain buzz).
+- Controllable two ways: the phone UI (preset chips 5/10/15/30/60 min or a numeric
+  keypad for any value, + start/stop), or the watch (Interval mode → "Phone
+  reminder" toggle sends `reminderStart`/`reminderStop`). It's decoupled from the
+  in-app timer, so it keeps running after the watch app closes; stop it from
+  either side.
+- Requires Garmin smart notifications enabled and notification access granted to
+  Garmin Connect. Reliability is device-dependent — test on your watch.
+
+Message protocol (watch → phone): `{cmd:"start", speed}`, `{cmd:"stop"}`,
+`{cmd:"reminderStart", intervalSec}`, `{cmd:"reminderStop"}`.
 
 ### Build
 
@@ -59,3 +98,26 @@ The Connect IQ companion SDK comes from Maven Central
 
 Builds and runs as-is; verified installed with the foreground listener service
 active.
+
+## References
+
+### Disclaimer
+
+This project is an independent software experiment created for personal use and learning purposes. I do not have professional training or credentials in psychology, psychotherapy, psychiatry, or any related clinical field.
+
+Lullhum is not intended to diagnose, treat, prevent, or cure any medical or psychological condition, nor is it a substitute for professional healthcare, therapy, or psychological treatment. Any references to EMDR, bilateral stimulation, breathing techniques, or related concepts are provided for informational context only.
+
+The application was developed primarily as a personal exploration of wearable haptics, timing synchronization, and user experience design, with assistance from generative AI tools. Any use of the software is at the user's own discretion and risk.
+
+### Research
+
+* **Good Vibrations: Bilateral Tactile Stimulation Decreases Startle Magnitude During Negative Imagination and Increases Skin Conductance Response for Positive Imagination in an Affective Startle Reflex Paradigm**
+  https://www.sciencedirect.com/science/article/abs/pii/S2468749920300788
+
+* **An Efficient System for Eye Movement Desensitization and Reprocessing (EMDR) Therapy: A Pilot Study**
+  https://pmc.ncbi.nlm.nih.gov/articles/PMC8776167/
+
+### Inspiration
+
+* **Complete Guide to EMDR Bilateral Stimulation**
+  https://www.coralehr.com/blog/emdr-bilateral-stimulation-guide/

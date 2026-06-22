@@ -1,9 +1,21 @@
 using Toybox.WatchUi;
 
-// Config screens: a parameter row cycles its value in place; "Start" launches.
+// Per-mode settings. Cycling a row updates the value, persists it, and applies
+// it live. "Done" returns to the running screen and ensures it's vibrating.
 
-function launchRunning() {
-    WatchUi.pushView(new RunningView(), new RunningDelegate(), WatchUi.SLIDE_LEFT);
+// Persist + apply a change while a value is being cycled.
+function applyChange() {
+    Config.save();
+    getController().restart();
+    WatchUi.requestUpdate();
+}
+
+// Return to the foreground running screen (pop the config + mode menus) and start.
+function finishConfig() {
+    var controller = getController();
+    if (!controller.isRunning()) { controller.start(); }
+    WatchUi.popView(WatchUi.SLIDE_RIGHT); // close config menu
+    WatchUi.popView(WatchUi.SLIDE_RIGHT); // close mode menu -> running screen
 }
 
 // ---- Mode 1: Alternating --------------------------------------------------
@@ -13,7 +25,7 @@ class AltConfigMenu extends WatchUi.Menu2 {
         Menu2.initialize({ :title => "Alternating" });
         addItem(new WatchUi.MenuItem("Speed", Config.speedLabel(), :speed, {}));
         addItem(new WatchUi.MenuItem("Duration", Config.durationLabel(), :duration, {}));
-        addItem(new WatchUi.MenuItem("Start", null, :start, {}));
+        addItem(new WatchUi.MenuItem("Done", null, :done, {}));
     }
 }
 
@@ -22,17 +34,15 @@ class AltConfigDelegate extends WatchUi.Menu2InputDelegate {
 
     function onSelect(item) {
         var id = item.getId();
+        if (id == :done) { finishConfig(); return; }
         if (id == :speed) {
             Config.cycleSpeed();
             item.setSubLabel(Config.speedLabel());
-            WatchUi.requestUpdate();
-        } else if (id == :duration) {
+        } else {
             Config.cycleDuration();
             item.setSubLabel(Config.durationLabel());
-            WatchUi.requestUpdate();
-        } else if (id == :start) {
-            launchRunning();
         }
+        applyChange();
     }
 }
 
@@ -42,7 +52,9 @@ class IntervalConfigMenu extends WatchUi.Menu2 {
     function initialize() {
         Menu2.initialize({ :title => "Interval" });
         addItem(new WatchUi.MenuItem("Interval", Config.intervalLabel(), :interval, {}));
-        addItem(new WatchUi.MenuItem("Start", null, :start, {}));
+        // Hand the interval to the phone to keep buzzing in the background (>=5 min).
+        addItem(new WatchUi.MenuItem("Phone reminder", Config.phoneReminderLabel(), :phone, {}));
+        addItem(new WatchUi.MenuItem("Done", null, :done, {}));
     }
 }
 
@@ -51,12 +63,21 @@ class IntervalConfigDelegate extends WatchUi.Menu2InputDelegate {
 
     function onSelect(item) {
         var id = item.getId();
-        if (id == :interval) {
+        if (id == :done) {
+            finishConfig();
+        } else if (id == :phone) {
+            Config.phoneReminderOn = !Config.phoneReminderOn;
+            if (Config.phoneReminderOn) {
+                Comm.sendReminderStart(Config.intervalSec());
+            } else {
+                Comm.sendReminderStop();
+            }
+            item.setSubLabel(Config.phoneReminderLabel());
+            WatchUi.requestUpdate();
+        } else {
             Config.cycleInterval();
             item.setSubLabel(Config.intervalLabel());
-            WatchUi.requestUpdate();
-        } else if (id == :start) {
-            launchRunning();
+            applyChange();
         }
     }
 }
@@ -67,13 +88,13 @@ class BreathConfigMenu extends WatchUi.Menu2 {
     function initialize() {
         Menu2.initialize({ :title => "Breathing" });
         addItem(new WatchUi.MenuItem("Preset", Config.presetLabel(), :preset, {}));
-        // Custom phase rows (only used when preset = Custom).
+        // Custom phase rows (used when preset = Custom).
         addItem(new WatchUi.MenuItem("Inhale 1", Config.customPhaseLabel(0), :p0, {}));
         addItem(new WatchUi.MenuItem("Inhale 2", Config.customPhaseLabel(1), :p1, {}));
         addItem(new WatchUi.MenuItem("Hold", Config.customPhaseLabel(2), :p2, {}));
         addItem(new WatchUi.MenuItem("Exhale", Config.customPhaseLabel(3), :p3, {}));
         addItem(new WatchUi.MenuItem("Hold 2", Config.customPhaseLabel(4), :p4, {}));
-        addItem(new WatchUi.MenuItem("Start", null, :start, {}));
+        addItem(new WatchUi.MenuItem("Done", null, :done, {}));
     }
 }
 
@@ -82,22 +103,25 @@ class BreathConfigDelegate extends WatchUi.Menu2InputDelegate {
 
     function onSelect(item) {
         var id = item.getId();
-        if (id == :preset) {
+        if (id == :done) {
+            finishConfig();
+        } else if (id == :preset) {
             Config.cyclePreset();
             item.setSubLabel(Config.presetLabel());
-            WatchUi.requestUpdate();
-        } else if (id == :p0) {
-            Config.cycleCustomPhase(0); item.setSubLabel(Config.customPhaseLabel(0)); WatchUi.requestUpdate();
-        } else if (id == :p1) {
-            Config.cycleCustomPhase(1); item.setSubLabel(Config.customPhaseLabel(1)); WatchUi.requestUpdate();
-        } else if (id == :p2) {
-            Config.cycleCustomPhase(2); item.setSubLabel(Config.customPhaseLabel(2)); WatchUi.requestUpdate();
-        } else if (id == :p3) {
-            Config.cycleCustomPhase(3); item.setSubLabel(Config.customPhaseLabel(3)); WatchUi.requestUpdate();
-        } else if (id == :p4) {
-            Config.cycleCustomPhase(4); item.setSubLabel(Config.customPhaseLabel(4)); WatchUi.requestUpdate();
-        } else if (id == :start) {
-            launchRunning();
+            applyChange();
+        } else {
+            var phase = phaseIndex(id);
+            Config.cycleCustomPhase(phase);
+            item.setSubLabel(Config.customPhaseLabel(phase));
+            applyChange();
         }
+    }
+
+    hidden function phaseIndex(id) {
+        if (id == :p0) { return 0; }
+        if (id == :p1) { return 1; }
+        if (id == :p2) { return 2; }
+        if (id == :p3) { return 3; }
+        return 4;
     }
 }
