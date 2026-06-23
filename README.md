@@ -50,51 +50,50 @@ app → Settings, or Connect IQ Store / Express):
 | **Baseline window (min)** | Minutes of pre-session history averaged as the baseline (default 15). |
 | **Recovery window (min)** | Minutes after a session before the recovery is read (default 15, minimum 5). |
 
-Both blank by default, so nothing is sent until configured. At each session end
-(sessions under 30 s are skipped) the watch writes **one HA sensor entity per
-metric** via `POST /api/states/sensor.lullhum_<metric>` (`Authorization: Bearer
-<token>`), sent sequentially. Each carries `state_class: measurement` so HA's
-statistics engine plots it over time directly — **no template sensors needed**.
-`session_type` and `start`/`end` (ISO 8601 UTC) ride along as attributes.
+Both blank by default, so nothing is sent until configured. Each metric is its
+own HA sensor entity, written via `POST /api/states/sensor.lullhum_<metric>`
+(`Authorization: Bearer <token>`). Each carries `state_class: measurement` so
+HA's statistics engine plots it over time directly — **no template sensors
+needed**. `session_type` and `start`/`end` (ISO 8601 UTC) ride along as
+attributes. Plot any of them with a **Statistics graph** or **History** card.
 
-| Entity | Meaning | Unit |
-|--------|---------|------|
-| `sensor.lullhum_hr_avg` | mean HR over the session | bpm |
-| `sensor.lullhum_hr_min` / `_max` | HR range | bpm |
-| `sensor.lullhum_hr_delta` | end − start HR (negative = settling) | bpm |
-| `sensor.lullhum_duration` | session length | s |
-| `sensor.lullhum_resp_end` / `_delta` | respiration rate + change | br/min |
-| `sensor.lullhum_stress_end` / `_delta` | Garmin stress + change | — |
-
-The `resp_*` / `stress_*` entities only appear when the device exposes those
-histories. Plot any of them with a **Statistics graph** or **History** card; a
-falling `hr_delta` / `stress_delta` across sessions is the signal that the app
-is having an effect.
-
-**Baseline & recovery (before / after the session).** To measure *effect* rather
-than just in-session state, the app frames each session against the surrounding
+The whole point is *effect*, so each session is framed against the surrounding
 windows — and because Garmin logs HR/stress/respiration continuously, neither
-needs the app to be running:
+window needs the app to be running:
+
+| Entity | Window | Unit |
+|--------|--------|------|
+| `sensor.lullhum_hr_baseline` | mean HR over the N min **before** the session | bpm |
+| `sensor.lullhum_hr_avg` | mean HR **during** the session | bpm |
+| `sensor.lullhum_hr_recovery` | mean HR over the N min **after** the session | bpm |
+| `sensor.lullhum_hr_recovery_delta` | recovery − baseline (negative = settled) | bpm |
+| `sensor.lullhum_duration` | session length | s |
+| `sensor.lullhum_stress_baseline` / `_recovery` | Garmin stress before / after | — |
+| `sensor.lullhum_resp_baseline` / `_recovery` | respiration before / after | br/min |
+
+`hr_recovery_delta` is the headline: a consistently negative value across
+sessions is the signal that the app is having an effect. The `stress_*` /
+`resp_*` entities only appear when the device exposes those histories.
 
 - **Baseline** is read back from `SensorHistory` at session end (the configured
-  minutes *before* you started) → `sensor.lullhum_hr_baseline`,
-  `stress_baseline`, `resp_baseline`.
+  minutes *before* you started).
 - **Recovery** can't be read until it happens, so a Connect IQ **background
   service** registers a one-shot temporal event and wakes the configured minutes
-  *after* the session ends — even if you've exited the app — reads that window
-  and posts `sensor.lullhum_hr_recovery`, `hr_recovery_delta` (recovery −
-  baseline), `stress_recovery`, `resp_recovery`.
+  *after* the session — even after you've closed the app.
 
 The recovery window has a hard **5-minute floor** (the platform's minimum for
 background temporal events). History resolution is coarser than live sampling
-(Garmin stores HR every few minutes when you're not in an activity), so baseline
-and recovery are window averages, not high-res curves — fine for trend deltas.
+(Garmin stores HR every few minutes when you're not in an activity), so the
+windows are averages, not high-res curves — fine for trend deltas.
 
-> **Delivery:** the watch relays each POST through the phone over BLE, which is
-> slow, so the metrics are **background-backed** — sent immediately at session
-> end, and the post-session background wake re-sends any that didn't confirm (so
-> closing the app right after a session doesn't lose them). States are idempotent,
-> so a re-send just overwrites.
+> **Delivery is background-only.** The app has no stop button — closing it *is*
+> "stop" — so an immediate send at session end would be cut off mid-queue (the
+> watch relays each POST through the phone over BLE, which is slow). Instead the
+> whole batch is persisted and sent **together with the recovery readings from
+> the post-session background wake** (~recovery-window minutes later). So expect
+> all metrics to appear in HA only after that delay, not right when you finish.
+> The metric set is deliberately small because the background process has a
+> ~30-second budget for the BLE-relayed POSTs.
 
 > **Note:** states set via the REST API aren't backed by an integration, so they
 > can't be attached to an HA **device** (only MQTT discovery / a custom
@@ -104,9 +103,9 @@ and recovery are window averages, not high-res curves — fine for trend deltas.
 > **More proxies worth adding later:** beat-to-beat **HRV (RMSSD)** is the gold
 > standard for parasympathetic tone but has limited in-app access on most
 > devices; **Body Battery** and **Pulse Ox** move too slowly to show a
-> within-session effect (better for day-level trends). Stress + respiration +
-> HR-delta are the three that best distinguish genuine relaxation from merely
-> sitting still.
+> within-session effect (better for day-level trends). The HR recovery delta,
+> stress, and respiration are the proxies that best distinguish genuine
+> relaxation from merely sitting still.
 
 ### Build
 

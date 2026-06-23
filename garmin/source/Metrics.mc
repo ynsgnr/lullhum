@@ -81,43 +81,25 @@ module Metrics {
         endSec = Time.now().value();
         if (endSec - startSec < MIN_SESSION_SEC || hrCount == 0) { return; }
 
-        // One real HA sensor entity per metric, each with state_class so HA's
-        // statistics engine plots it over time directly (no template sensors).
+        // Keep the metric set lean: every entity is one BLE-relayed POST, and the
+        // whole batch is sent later from the time-limited (~30s) background
+        // process. Each carries state_class so HA plots it directly (no template
+        // sensors). Baseline reads the pre-session window back from history
+        // (Garmin logs HR even when the app isn't running).
         pending = [];
-        addMetric("hr_avg", "Lullhum HR avg", hrSum / hrCount, "bpm");
-        addMetric("hr_min", "Lullhum HR min", hrMin, "bpm");
-        addMetric("hr_max", "Lullhum HR max", hrMax, "bpm");
-        addMetric("hr_delta", "Lullhum HR delta", hrEnd - hrStart, "bpm");
-        addMetric("duration", "Lullhum duration", endSec - startSec, "s");
-
-        var respEnd = newestRespiration();
-        if (respEnd != null) { addMetric("resp_end", "Lullhum respiration", respEnd, "br/min"); }
-        if (respStart != null && respEnd != null) {
-            addMetric("resp_delta", "Lullhum respiration delta", respEnd - respStart, "br/min");
-        }
-
-        var stressEnd = newestStress();
-        if (stressEnd != null) { addMetric("stress_end", "Lullhum stress", stressEnd, null); }
-        if (stressStart != null && stressEnd != null) {
-            addMetric("stress_delta", "Lullhum stress delta", stressEnd - stressStart, null);
-        }
-
-        // Baseline: Garmin logs HR even when the app isn't running, so the
-        // pre-session window can be read back from history retroactively.
         var hrBaseline = avgHrInWindow(startSec - baselineWindowSec(), startSec);
         if (hrBaseline != null) { addMetric("hr_baseline", "Lullhum HR baseline", hrBaseline, "bpm"); }
+        addMetric("hr_avg", "Lullhum HR avg", hrSum / hrCount, "bpm");
+        addMetric("duration", "Lullhum duration", endSec - startSec, "s");
         if (stressStart != null) { addMetric("stress_baseline", "Lullhum stress baseline", stressStart, null); }
         if (respStart != null) { addMetric("resp_baseline", "Lullhum respiration baseline", respStart, "br/min"); }
 
-        // Persist the batch so the background service can re-send it if the app
-        // is closed before the immediate send below finishes draining (states
-        // are idempotent, so a re-send just overwrites). Recovery happens in the
-        // future, so the same background wake reads + posts it then.
+        // Delivery is background-only: the app has no stop button (closing it is
+        // "stop"), so an immediate send would be cut off mid-queue. Persist the
+        // batch and let the post-session background wake send it all at once,
+        // together with the recovery readings (~recovery-window minutes later).
         Storage.setValue("batch", pending);
-        Storage.setValue("batch_sent", false);
         scheduleRecovery(hrBaseline);
-
-        sendNext();
     }
 
     // ---- Recovery (background) ---------------------------------------------
@@ -144,13 +126,10 @@ module Metrics {
         bgMode = true;
         pending = [];
 
-        // Catch-up: re-queue the session/baseline batch unless the immediate
-        // foreground send already drained it (avoids duplicate history points).
-        if (Storage.getValue("batch_sent") != true) {
-            var batch = Storage.getValue("batch");
-            if (batch instanceof Lang.Array) {
-                for (var i = 0; i < batch.size(); i++) { pending.add(batch[i]); }
-            }
+        // Session + baseline batch, persisted at session end.
+        var batch = Storage.getValue("batch");
+        if (batch instanceof Lang.Array) {
+            for (var i = 0; i < batch.size(); i++) { pending.add(batch[i]); }
         }
 
         // Recovery metrics, now that the window has elapsed.
@@ -231,13 +210,7 @@ module Metrics {
         // Drop the request just sent and chain the next, regardless of result;
         // the watch keeps working even if HA is unreachable.
         if (pending.size() > 0) { pending = pending.slice(1, null); }
-        if (pending.size() == 0) {
-            // Foreground fully drained the session batch -> tell the background
-            // catch-up to skip it (the recovery metrics still go out later).
-            if (!bgMode) { Storage.setValue("batch_sent", true); }
-            finishBg();
-            return;
-        }
+        if (pending.size() == 0) { finishBg(); return; }
         sendNext();
     }
 
@@ -277,33 +250,43 @@ module Metrics {
     // samples fall in the window.
     function avgHrInWindow(fromSec as Number, toSec as Number) as Number? {
         if (!(Toybox has :SensorHistory) || !(SensorHistory has :getHeartRateHistory)) { return null; }
-        var span = Time.now().value() - fromSec + 60;
-        if (span < 1) { span = 1; }
-        var it = SensorHistory.getHeartRateHistory({ :period => new Time.Duration(span), :order => SensorHistory.ORDER_NEWEST_FIRST });
-        if (it == null) { return null; }
-        var sum = 0;
-        var n = 0;
-        var s = it.next();
-        while (s != null) {
-            if (s.data != null && s.when != null) {
-                var w = s.when.value();
-                if (w >= fromSec && w <= toSec) { sum += s.data; n++; }
+        try {
+            var span = Time.now().value() - fromSec + 60;
+            if (span < 1) { span = 1; }
+            var it = SensorHistory.getHeartRateHistory({ :period => new Time.Duration(span), :order => SensorHistory.ORDER_NEWEST_FIRST });
+            if (it == null) { return null; }
+            var sum = 0;
+            var n = 0;
+            var s = it.next();
+            while (s != null) {
+                if (s.data != null && s.when != null) {
+                    var w = s.when.value();
+                    if (w >= fromSec && w <= toSec) { sum += s.data; n++; }
+                }
+                s = it.next();
             }
-            s = it.next();
+            return (n > 0) ? sum / n : null;
+        } catch (e) {
+            return null;
         }
-        return (n > 0) ? sum / n : null;
     }
 
     function newestStress() as Number? {
         if (!(Toybox has :SensorHistory) || !(SensorHistory has :getStressHistory)) { return null; }
-        var it = SensorHistory.getStressHistory({ :period => 1, :order => SensorHistory.ORDER_NEWEST_FIRST });
-        return sampleValue(it);
+        try {
+            return sampleValue(SensorHistory.getStressHistory({ :period => 1, :order => SensorHistory.ORDER_NEWEST_FIRST }));
+        } catch (e) {
+            return null;
+        }
     }
 
     function newestRespiration() as Number? {
         if (!(Toybox has :SensorHistory) || !(SensorHistory has :getRespirationRateHistory)) { return null; }
-        var it = SensorHistory.getRespirationRateHistory({ :period => 1, :order => SensorHistory.ORDER_NEWEST_FIRST });
-        return sampleValue(it);
+        try {
+            return sampleValue(SensorHistory.getRespirationRateHistory({ :period => 1, :order => SensorHistory.ORDER_NEWEST_FIRST }));
+        } catch (e) {
+            return null;
+        }
     }
 
     function sampleValue(it) as Number? {
