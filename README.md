@@ -90,9 +90,16 @@ background temporal events). History resolution is coarser than live sampling
 (Garmin stores HR every few minutes when you're not in an activity), so baseline
 and recovery are window averages, not high-res curves — fine for trend deltas.
 
+> **Delivery:** the watch relays each POST through the phone over BLE, which is
+> slow, so the metrics are **background-backed** — sent immediately at session
+> end, and the post-session background wake re-sends any that didn't confirm (so
+> closing the app right after a session doesn't lose them). States are idempotent,
+> so a re-send just overwrites.
+
 > **Note:** states set via the REST API aren't backed by an integration, so they
-> read `unknown` after a Home Assistant restart until the next session repopulates
-> them — recorded history is retained.
+> can't be attached to an HA **device** (only MQTT discovery / a custom
+> integration can do that), and they read `unknown` after a Home Assistant
+> restart until the next session repopulates them — recorded history is retained.
 
 > **More proxies worth adding later:** beat-to-beat **HRV (RMSSD)** is the gold
 > standard for parasympathetic tone but has limited in-app access on most

@@ -109,8 +109,12 @@ module Metrics {
         if (stressStart != null) { addMetric("stress_baseline", "Lullhum stress baseline", stressStart, null); }
         if (respStart != null) { addMetric("resp_baseline", "Lullhum respiration baseline", respStart, "br/min"); }
 
-        // Recovery happens in the future, so hand it to a background service that
-        // wakes after the recovery window and reads it from history then.
+        // Persist the batch so the background service can re-send it if the app
+        // is closed before the immediate send below finishes draining (states
+        // are idempotent, so a re-send just overwrites). Recovery happens in the
+        // future, so the same background wake reads + posts it then.
+        Storage.setValue("batch", pending);
+        Storage.setValue("batch_sent", false);
         scheduleRecovery(hrBaseline);
 
         sendNext();
@@ -134,36 +138,47 @@ module Metrics {
     }
 
     // Called from BackgroundService.onTemporalEvent once the recovery window has
-    // elapsed. Reads the post-session window from history and pushes it, then
-    // ends the background process.
+    // elapsed. Re-sends the session/baseline batch if the foreground send didn't
+    // confirm it, reads + posts the recovery window, then ends the process.
     function pushRecovery() as Void {
         bgMode = true;
-        var recEnd = Storage.getValue("rec_end");
-        if (recEnd == null || baseUrl() == null) { finishBg(); return; }
-
-        var recSec = Storage.getValue("rec_win");
-        if (!(recSec instanceof Lang.Number)) { recSec = 300; }
-        var type = Storage.getValue("rec_type");
-        // Reuse start/end for the isoTime attributes: the recovery window itself.
-        sessionType = (type instanceof Lang.String) ? type : "";
-        startSec = recEnd;
-        endSec = recEnd + recSec;
-
         pending = [];
-        var hrRec = avgHrInWindow(recEnd, recEnd + recSec);
-        if (hrRec != null) {
-            addMetric("hr_recovery", "Lullhum HR recovery", hrRec, "bpm");
-            var base = Storage.getValue("rec_hr_baseline");
-            if (base instanceof Lang.Number && base > 0) {
-                addMetric("hr_recovery_delta", "Lullhum HR recovery delta", hrRec - base, "bpm");
+
+        // Catch-up: re-queue the session/baseline batch unless the immediate
+        // foreground send already drained it (avoids duplicate history points).
+        if (Storage.getValue("batch_sent") != true) {
+            var batch = Storage.getValue("batch");
+            if (batch instanceof Lang.Array) {
+                for (var i = 0; i < batch.size(); i++) { pending.add(batch[i]); }
             }
         }
-        var stressRec = newestStress();
-        if (stressRec != null) { addMetric("stress_recovery", "Lullhum stress recovery", stressRec, null); }
-        var respRec = newestRespiration();
-        if (respRec != null) { addMetric("resp_recovery", "Lullhum respiration recovery", respRec, "br/min"); }
 
+        // Recovery metrics, now that the window has elapsed.
+        var recEnd = Storage.getValue("rec_end");
+        if (recEnd instanceof Lang.Number && baseUrl() != null) {
+            var recSec = Storage.getValue("rec_win");
+            if (!(recSec instanceof Lang.Number)) { recSec = 900; }
+            var type = Storage.getValue("rec_type");
+            sessionType = (type instanceof Lang.String) ? type : "";
+            startSec = recEnd;            // reuse for the isoTime attributes
+            endSec = recEnd + recSec;     // (the recovery window itself)
+            var hrRec = avgHrInWindow(recEnd, recEnd + recSec);
+            if (hrRec != null) {
+                addMetric("hr_recovery", "Lullhum HR recovery", hrRec, "bpm");
+                var base = Storage.getValue("rec_hr_baseline");
+                if (base instanceof Lang.Number && base > 0) {
+                    addMetric("hr_recovery_delta", "Lullhum HR recovery delta", hrRec - base, "bpm");
+                }
+            }
+            var stressRec = newestStress();
+            if (stressRec != null) { addMetric("stress_recovery", "Lullhum stress recovery", stressRec, null); }
+            var respRec = newestRespiration();
+            if (respRec != null) { addMetric("resp_recovery", "Lullhum respiration recovery", respRec, "br/min"); }
+        }
+
+        Storage.deleteValue("batch");
         Storage.deleteValue("rec_end");
+
         if (pending.size() == 0) { finishBg(); return; }
         sendNext();
     }
@@ -216,7 +231,13 @@ module Metrics {
         // Drop the request just sent and chain the next, regardless of result;
         // the watch keeps working even if HA is unreachable.
         if (pending.size() > 0) { pending = pending.slice(1, null); }
-        if (pending.size() == 0) { finishBg(); return; }
+        if (pending.size() == 0) {
+            // Foreground fully drained the session batch -> tell the background
+            // catch-up to skip it (the recovery metrics still go out later).
+            if (!bgMode) { Storage.setValue("batch_sent", true); }
+            finishBg();
+            return;
+        }
         sendNext();
     }
 
