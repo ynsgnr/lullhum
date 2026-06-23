@@ -56,6 +56,9 @@ module Metrics {
             Sensor.setEnabledSensors([Sensor.SENSOR_HEARTRATE]);
             Sensor.enableSensorEvents(new Lang.Method(Metrics, :onSensor));
         }
+        // Mark the real session start now (app is foreground), so the mode
+        // entity's native History bar begins at the true time.
+        postMode(sessionType, isoTime(startSec), "");
     }
 
     function onSensor(info as Sensor.Info) as Void {
@@ -73,7 +76,10 @@ module Metrics {
         if (Sensor has :enableSensorEvents) { Sensor.enableSensorEvents(null); }
 
         endSec = Time.now().value();
-        if (endSec - startSec < MIN_SESSION_SEC || hrCount == 0) { return; }
+        if (endSec - startSec < MIN_SESSION_SEC || hrCount == 0) {
+            postMode("idle", isoTime(startSec), isoTime(endSec)); // close the bar
+            return;
+        }
 
         // Stash the session (baseline read back from history); the background
         // wake adds recovery and sends everything. Delivery is background-only:
@@ -93,6 +99,10 @@ module Metrics {
         if (respStart != null) { rec.put("resp_baseline", respStart); }
         Storage.setValue("pending_session", rec);
         registerRecovery();
+        // Best-effort live close (flushes if the app stays open, e.g. a timed
+        // session completing); if you stop by closing the app it won't flush, so
+        // the background wake closes the bar as a fallback.
+        postMode("idle", isoTime(startSec), isoTime(endSec));
     }
 
     // ---- Recovery + send (background) --------------------------------------
@@ -129,7 +139,7 @@ module Metrics {
         }
 
         pending = [];
-        addSession(rec);  // text state -> native History timeline bar
+        addSessionClose(rec);  // close the mode bar (fallback if live end didn't flush)
         if (hrRec != null && hrBaseline instanceof Lang.Number) {
             addMetric("hr_recovery_delta", "Lullhum HR recovery delta", hrRec - hrBaseline, "bpm");
         }
@@ -160,13 +170,34 @@ module Metrics {
 
     // ---- Home Assistant REST states API ------------------------------------
 
-    // Text mode entity: HA's built-in History renders it as a labeled timeline
-    // bar (no state_class, since the state is text).
-    function addSession(rec as Dictionary) as Void {
+    // Immediately set the mode entity's state (foreground, single POST). Used to
+    // mark the real session start (state = mode) and end (state = "idle"); HA's
+    // built-in History renders the text state as a labeled timeline bar.
+    function postMode(state as String, startIso as String, endIso as String) as Void {
+        if (baseUrl() == null) { return; }
+        pending = [{
+            "path" => "/api/states/sensor.lullhum_session",
+            "body" => {
+                "state" => state,
+                "attributes" => {
+                    "friendly_name" => "Lullhum session",
+                    "icon" => "mdi:meditation",
+                    "mode" => sessionType,
+                    "start" => startIso,
+                    "end" => endIso
+                }
+            }
+        }];
+        sendNext();
+    }
+
+    // Background fallback: close the mode bar (state = "idle") in case the live
+    // end POST didn't flush (app closed to stop). Carries the real times.
+    function addSessionClose(rec as Dictionary) as Void {
         pending.add({
             "path" => "/api/states/sensor.lullhum_session",
             "body" => {
-                "state" => rec.get("mode"),
+                "state" => "idle",
                 "attributes" => {
                     "friendly_name" => "Lullhum session",
                     "icon" => "mdi:meditation",

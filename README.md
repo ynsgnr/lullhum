@@ -78,11 +78,19 @@ signal the app is having an effect. `stress_*` / `resp_*` appear only when the
 device exposes those histories. Entities send most-important-first, so if the
 background run is cut short the headline ones still land.
 
+**`sensor.lullhum_session` timeline.** Its state is set **live**: it flips to the
+mode at the real session start (app is open, so this is accurate) and to `idle`
+at the end, so the native History bar lines up with the actual session window.
+The end POST is best-effort — if you stop by *closing* the app it won't flush, so
+the background wake sets `idle` as a fallback (in that case the bar runs from the
+true start to roughly the background-wake time). The REST API can't backdate
+state changes, so the start/end *attributes* hold the exact times regardless.
+
 - **Baseline** is read back from `SensorHistory` at session end (the configured
   minutes *before* you started).
 - **Recovery** can't be read until it happens, so a Connect IQ **background
   service** wakes the configured minutes *after* the session — even after you've
-  closed the app — fills in the recovery values, and sends every entity.
+  closed the app — fills in the recovery values, and sends every numeric entity.
 
 The recovery window has a hard **5-minute floor** (the platform's minimum for
 background temporal events). History resolution is coarser than live sampling
