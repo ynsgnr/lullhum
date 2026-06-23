@@ -55,6 +55,14 @@ class VibrationController {
         } else {
             startBreathing();
         }
+
+        Metrics.onSessionStart(sessionType());
+    }
+
+    hidden function sessionType() as String {
+        if (mMode == Config.MODE_ALTERNATING) { return "alternating"; }
+        if (mMode == Config.MODE_INTERVAL) { return "interval"; }
+        return "breathing:" + Config.presetLabel();
     }
 
     function stop() as Void {
@@ -65,6 +73,7 @@ class VibrationController {
         if (mMode == Config.MODE_ALTERNATING) {
             Comm.sendStop(); // failure (no phone) is ignored; the watch keeps going
         }
+        Metrics.onSessionEnd();
     }
 
     // Re-read the (possibly changed) config and apply it live, only if running.

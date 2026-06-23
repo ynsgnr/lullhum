@@ -1,3 +1,5 @@
 <strings>
     <string id="AppName">Lullhum</string>
+    <string id="SettingHaUrl">Home Assistant URL</string>
+    <string id="SettingHaToken">Long-lived access token</string>
 </strings>

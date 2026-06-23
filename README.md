@@ -32,6 +32,38 @@ Foreground Simple App with three modes:
 > platform offers no API for continuous background haptics. (The Android companion,
 > being a foreground service, is unaffected.)
 
+### Metrics → Home Assistant
+
+To check whether sessions actually have an effect, the watch logs each session
+and pushes it to Home Assistant (`Metrics.mc`). Heart rate is the primary proxy
+(a lower / falling HR suggests parasympathetic "rest-and-digest" activation);
+respiration rate and Garmin's HRV-derived **stress score** are captured at the
+start and end as stronger, lower-noise markers of nervous-system down-regulation.
+
+Configure under the Connect IQ app **Settings** (Garmin Connect Mobile → the
+app → Settings, or Connect IQ Store / Express):
+
+| Setting | Value |
+|---------|-------|
+| **Home Assistant URL** | e.g. `https://your-home.ui.nabu.casa` (must be HTTPS and reachable from wherever the phone has internet — the watch relays web requests through the phone's Garmin Connect app). |
+| **Long-lived access token** | HA → profile → *Long-lived access tokens* → Create. |
+
+Both blank by default, so nothing is sent until configured. At each session end
+(sessions under 30 s are skipped) the watch does a single
+`POST /api/states/sensor.lullhum_session` with `Authorization: Bearer <token>`.
+The entity **state** is `hr_avg` (so it graphs directly); the rest ride in
+attributes: `session_type`, `start`/`end` (ISO 8601 UTC), `duration_sec`,
+`hr_start`/`hr_end`/`hr_min`/`hr_max`/`hr_delta`, and `resp_*` / `stress_*`
+start/end/delta when the device exposes them. Split them into individual history
+graphs with HA template sensors if you want per-metric trends.
+
+> **More proxies worth adding later:** beat-to-beat **HRV (RMSSD)** is the gold
+> standard for parasympathetic tone but has limited in-app access on most
+> devices; **Body Battery** and **Pulse Ox** move too slowly to show a
+> within-session effect (better for day-level trends). Stress + respiration +
+> HR-delta are the three that best distinguish genuine relaxation from merely
+> sitting still.
+
 ### Build
 
 Requires the Connect IQ SDK (tested with 9.2.0), Java, and a developer key.

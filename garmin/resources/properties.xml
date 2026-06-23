@@ -1,0 +1,6 @@
+<properties>
+    <!-- Home Assistant push target. Set in Garmin Connect Mobile (or Express)
+         under the app's Settings; both blank by default so metrics stay off. -->
+    <property id="haUrl" type="string"></property>
+    <property id="haToken" type="string"></property>
+</properties>
