@@ -9,18 +9,18 @@ using Toybox.Application.Storage;
 using Toybox.Background;
 using Toybox.PersistedContent;
 
-// Per-session relaxation metrics pushed to Home Assistant.
+// Per-session relaxation metrics pushed to Home Assistant as plain entities.
 //
-// Heart rate is the primary proxy (lower / falling during a session suggests
-// parasympathetic activation). Respiration rate and Garmin's HRV-derived stress
-// score are captured too as stronger, lower-noise proxies. To judge effect, each
-// session is framed against a baseline (the pre-session window, read back from
-// SensorHistory) and a recovery window (read minutes later by a background
-// service). Nothing is sent unless the HA URL + token are configured.
+// Each session writes a handful of ordinary `sensor.lullhum_*` states that HA
+// renders natively with no template / card / config: the mode is a text state
+// (`sensor.lullhum_session`) that shows as a History timeline bar, and the rest
+// are numeric states that show as History lines. Metrics are framed as
+// baseline -> during -> recovery; heart rate is the primary proxy, with Garmin's
+// HRV-derived stress and respiration as stronger parasympathetic markers.
+// Nothing is sent unless the HA URL + token are configured.
 module Metrics {
 
-    // Sessions shorter than this are ignored (covers accidental starts and the
-    // stop/start churn from live config edits).
+    // Sessions shorter than this are ignored (accidental starts / config churn).
     const MIN_SESSION_SEC = 30;
 
     var active = false;
@@ -29,10 +29,6 @@ module Metrics {
     var endSec = 0;
 
     // Heart rate, accumulated live from sensor events.
-    var hrStart = 0;
-    var hrEnd = 0;
-    var hrMin = 0;
-    var hrMax = 0;
     var hrSum = 0;
     var hrCount = 0;
 
@@ -40,18 +36,20 @@ module Metrics {
     var respStart = null;
     var stressStart = null;
 
-    // Queue of one-per-metric POSTs, drained sequentially: Connect IQ only
-    // reliably handles one web request at a time, so each fires the next.
+    // Send queue, drained sequentially in the background; bgMode lets the final
+    // callback end the background process. pubStart/pubEnd are the session window
+    // (ISO) attached to every entity for context.
     var pending = [];
-    // True while draining in the background service, so the last POST can exit it.
     var bgMode = false;
+    var pubStart = "";
+    var pubEnd = "";
 
     function onSessionStart(type as String) as Void {
         if (!configured()) { return; }
         active = true;
         sessionType = type;
         startSec = Time.now().value();
-        hrStart = 0; hrEnd = 0; hrMin = 0; hrMax = 0; hrSum = 0; hrCount = 0;
+        hrSum = 0; hrCount = 0;
         respStart = newestRespiration();
         stressStart = newestStress();
         if (Sensor has :setEnabledSensors) {
@@ -64,12 +62,8 @@ module Metrics {
         if (!active) { return; }
         var hr = info.heartRate;
         if (hr != null && hr > 0) {
-            if (hrStart == 0) { hrStart = hr; }
-            hrEnd = hr;
             hrSum += hr;
             hrCount++;
-            if (hrMin == 0 || hr < hrMin) { hrMin = hr; }
-            if (hr > hrMax) { hrMax = hr; }
         }
     }
 
@@ -81,83 +75,79 @@ module Metrics {
         endSec = Time.now().value();
         if (endSec - startSec < MIN_SESSION_SEC || hrCount == 0) { return; }
 
-        // Keep the metric set lean: every entity is one BLE-relayed POST, and the
-        // whole batch is sent later from the time-limited (~30s) background
-        // process. Each carries state_class so HA plots it directly (no template
-        // sensors). Baseline reads the pre-session window back from history
-        // (Garmin logs HR even when the app isn't running).
-        pending = [];
+        // Stash the session (baseline read back from history); the background
+        // wake adds recovery and sends everything. Delivery is background-only:
+        // the app has no stop button (closing it is "stop"), so an immediate send
+        // would be cut off mid-queue.
+        var rec = {};
+        rec.put("mode", sessionType);
+        rec.put("start", isoTime(startSec));
+        rec.put("end", isoTime(endSec));
+        rec.put("end_epoch", endSec);
+        rec.put("rec_win", recoveryWindowSec());
+        rec.put("duration_sec", endSec - startSec);
+        rec.put("hr_avg", hrSum / hrCount);
         var hrBaseline = avgHrInWindow(startSec - baselineWindowSec(), startSec);
-        if (hrBaseline != null) { addMetric("hr_baseline", "Lullhum HR baseline", hrBaseline, "bpm"); }
-        addMetric("hr_avg", "Lullhum HR avg", hrSum / hrCount, "bpm");
-        addMetric("duration", "Lullhum duration", endSec - startSec, "s");
-        if (stressStart != null) { addMetric("stress_baseline", "Lullhum stress baseline", stressStart, null); }
-        if (respStart != null) { addMetric("resp_baseline", "Lullhum respiration baseline", respStart, "br/min"); }
-
-        // Delivery is background-only: the app has no stop button (closing it is
-        // "stop"), so an immediate send would be cut off mid-queue. Persist the
-        // batch and let the post-session background wake send it all at once,
-        // together with the recovery readings (~recovery-window minutes later).
-        Storage.setValue("batch", pending);
-        scheduleRecovery(hrBaseline);
+        if (hrBaseline != null) { rec.put("hr_baseline", hrBaseline); }
+        if (stressStart != null) { rec.put("stress_baseline", stressStart); }
+        if (respStart != null) { rec.put("resp_baseline", respStart); }
+        Storage.setValue("pending_session", rec);
+        registerRecovery();
     }
 
-    // ---- Recovery (background) ---------------------------------------------
+    // ---- Recovery + send (background) --------------------------------------
 
-    function scheduleRecovery(hrBaseline as Number?) as Void {
+    function registerRecovery() as Void {
         if (!(Toybox has :Background) || !(Background has :registerForTemporalEvent)) { return; }
         if (baseUrl() == null) { return; }
-        var recSec = recoveryWindowSec();
-        Storage.setValue("rec_end", endSec);
-        Storage.setValue("rec_type", sessionType);
-        Storage.setValue("rec_win", recSec);
-        Storage.setValue("rec_hr_baseline", hrBaseline == null ? 0 : hrBaseline);
         try {
-            Background.registerForTemporalEvent(new Time.Moment(endSec + recSec));
+            Background.registerForTemporalEvent(new Time.Moment(endSec + recoveryWindowSec()));
         } catch (e) {
             // e.g. an event is already scheduled; the latest session wins.
         }
     }
 
     // Called from BackgroundService.onTemporalEvent once the recovery window has
-    // elapsed. Re-sends the session/baseline batch if the foreground send didn't
-    // confirm it, reads + posts the recovery window, then ends the process.
+    // elapsed: reads the recovery window from history and sends every entity.
+    // Ordered most-important-first so a background timeout drops only the tail.
     function pushRecovery() as Void {
         bgMode = true;
+        var rec = Storage.getValue("pending_session");
+        if (!(rec instanceof Lang.Dictionary) || baseUrl() == null) { finishBg(); return; }
+
+        sessionType = rec.get("mode");
+        pubStart = rec.get("start");
+        pubEnd = rec.get("end");
+
+        var hrBaseline = rec.get("hr_baseline");
+        var hrRec = null;
+        var recEnd = rec.get("end_epoch");
+        if (recEnd instanceof Lang.Number) {
+            var winSec = rec.get("rec_win");
+            if (!(winSec instanceof Lang.Number)) { winSec = 900; }
+            hrRec = avgHrInWindow(recEnd, recEnd + winSec);
+        }
+
         pending = [];
-
-        // Session + baseline batch, persisted at session end.
-        var batch = Storage.getValue("batch");
-        if (batch instanceof Lang.Array) {
-            for (var i = 0; i < batch.size(); i++) { pending.add(batch[i]); }
+        addSession(rec);  // text state -> native History timeline bar
+        if (hrRec != null && hrBaseline instanceof Lang.Number) {
+            addMetric("hr_recovery_delta", "Lullhum HR recovery delta", hrRec - hrBaseline, "bpm");
         }
+        if (hrBaseline instanceof Lang.Number) { addMetric("hr_baseline", "Lullhum HR baseline", hrBaseline, "bpm"); }
+        if (hrRec != null) { addMetric("hr_recovery", "Lullhum HR recovery", hrRec, "bpm"); }
+        addMetric("hr_avg", "Lullhum HR avg", rec.get("hr_avg"), "bpm");
+        addMetric("duration", "Lullhum duration", rec.get("duration_sec"), "s");
 
-        // Recovery metrics, now that the window has elapsed.
-        var recEnd = Storage.getValue("rec_end");
-        if (recEnd instanceof Lang.Number && baseUrl() != null) {
-            var recSec = Storage.getValue("rec_win");
-            if (!(recSec instanceof Lang.Number)) { recSec = 900; }
-            var type = Storage.getValue("rec_type");
-            sessionType = (type instanceof Lang.String) ? type : "";
-            startSec = recEnd;            // reuse for the isoTime attributes
-            endSec = recEnd + recSec;     // (the recovery window itself)
-            var hrRec = avgHrInWindow(recEnd, recEnd + recSec);
-            if (hrRec != null) {
-                addMetric("hr_recovery", "Lullhum HR recovery", hrRec, "bpm");
-                var base = Storage.getValue("rec_hr_baseline");
-                if (base instanceof Lang.Number && base > 0) {
-                    addMetric("hr_recovery_delta", "Lullhum HR recovery delta", hrRec - base, "bpm");
-                }
-            }
-            var stressRec = newestStress();
-            if (stressRec != null) { addMetric("stress_recovery", "Lullhum stress recovery", stressRec, null); }
-            var respRec = newestRespiration();
-            if (respRec != null) { addMetric("resp_recovery", "Lullhum respiration recovery", respRec, "br/min"); }
-        }
+        var stressBase = rec.get("stress_baseline");
+        if (stressBase != null) { addMetric("stress_baseline", "Lullhum stress baseline", stressBase, null); }
+        var stressRec = newestStress();
+        if (stressRec != null) { addMetric("stress_recovery", "Lullhum stress recovery", stressRec, null); }
+        var respBase = rec.get("resp_baseline");
+        if (respBase != null) { addMetric("resp_baseline", "Lullhum respiration baseline", respBase, "br/min"); }
+        var respRec = newestRespiration();
+        if (respRec != null) { addMetric("resp_recovery", "Lullhum respiration recovery", respRec, "br/min"); }
 
-        Storage.deleteValue("batch");
-        Storage.deleteValue("rec_end");
-
+        Storage.deleteValue("pending_session");
         if (pending.size() == 0) { finishBg(); return; }
         sendNext();
     }
@@ -170,16 +160,34 @@ module Metrics {
 
     // ---- Home Assistant REST states API ------------------------------------
 
-    // Queue a POST that sets sensor.lullhum_<key> to a numeric state, tagged so
-    // HA records long-term statistics for it. session_type/start/end ride along
-    // as attributes for context.
+    // Text mode entity: HA's built-in History renders it as a labeled timeline
+    // bar (no state_class, since the state is text).
+    function addSession(rec as Dictionary) as Void {
+        pending.add({
+            "path" => "/api/states/sensor.lullhum_session",
+            "body" => {
+                "state" => rec.get("mode"),
+                "attributes" => {
+                    "friendly_name" => "Lullhum session",
+                    "icon" => "mdi:meditation",
+                    "mode" => rec.get("mode"),
+                    "start" => rec.get("start"),
+                    "end" => rec.get("end"),
+                    "duration_sec" => rec.get("duration_sec")
+                }
+            }
+        });
+    }
+
+    // Numeric entity: state_class so HA records statistics and History draws a
+    // line. Session mode + start/end ride along as attributes.
     function addMetric(key as String, name as String, value as Number, unit as String?) as Void {
         var attrs = {
             "friendly_name" => name,
             "state_class" => "measurement",
-            "session_type" => sessionType,
-            "start" => isoTime(startSec),
-            "end" => isoTime(endSec)
+            "mode" => sessionType,
+            "start" => pubStart,
+            "end" => pubEnd
         };
         if (unit != null) { attrs.put("unit_of_measurement", unit); }
         pending.add({
@@ -189,7 +197,7 @@ module Metrics {
     }
 
     function sendNext() as Void {
-        if (pending.size() == 0) { return; }
+        if (pending.size() == 0) { finishBg(); return; }
         var url = baseUrl();
         var token = Application.Properties.getValue("haToken");
         if (url == null || token == null) { pending = []; finishBg(); return; }
@@ -207,8 +215,6 @@ module Metrics {
     }
 
     function onPost(responseCode as Number, data as Null or Dictionary or String or PersistedContent.Iterator) as Void {
-        // Drop the request just sent and chain the next, regardless of result;
-        // the watch keeps working even if HA is unreachable.
         if (pending.size() > 0) { pending = pending.slice(1, null); }
         if (pending.size() == 0) { finishBg(); return; }
         sendNext();

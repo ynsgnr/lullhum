@@ -50,36 +50,39 @@ app → Settings, or Connect IQ Store / Express):
 | **Baseline window (min)** | Minutes of pre-session history averaged as the baseline (default 15). |
 | **Recovery window (min)** | Minutes after a session before the recovery is read (default 15, minimum 5). |
 
-Both blank by default, so nothing is sent until configured. Each metric is its
-own HA sensor entity, written via `POST /api/states/sensor.lullhum_<metric>`
-(`Authorization: Bearer <token>`). Each carries `state_class: measurement` so
-HA's statistics engine plots it over time directly — **no template sensors
-needed**. `session_type` and `start`/`end` (ISO 8601 UTC) ride along as
-attributes. Plot any of them with a **Statistics graph** or **History** card.
+Both blank by default, so nothing is sent until configured. Each session writes a
+handful of **plain `sensor.lullhum_*` entities** via
+`POST /api/states/sensor.lullhum_<name>` (`Authorization: Bearer <token>`). They
+render in Home Assistant **with no template, card, or config** — the mode is a
+text state that HA's built-in History shows as a labeled timeline bar, and the
+numbers (tagged `state_class: measurement`) show as History lines. The session
+mode + `start`/`end` (ISO 8601 UTC) ride along as attributes on every entity.
 
-The whole point is *effect*, so each session is framed against the surrounding
-windows — and because Garmin logs HR/stress/respiration continuously, neither
-window needs the app to be running:
+Each session is framed as **baseline → during → recovery** (because Garmin logs
+HR/stress/respiration continuously, the before/after windows don't need the app
+running):
 
-| Entity | Window | Unit |
-|--------|--------|------|
-| `sensor.lullhum_hr_baseline` | mean HR over the N min **before** the session | bpm |
-| `sensor.lullhum_hr_avg` | mean HR **during** the session | bpm |
-| `sensor.lullhum_hr_recovery` | mean HR over the N min **after** the session | bpm |
-| `sensor.lullhum_hr_recovery_delta` | recovery − baseline (negative = settled) | bpm |
+| Entity | Meaning | Unit |
+|--------|---------|------|
+| `sensor.lullhum_session` | **mode** (`alternating` / `interval` / `breathing:…`) — text state, History timeline bar | — |
+| `sensor.lullhum_hr_recovery_delta` | recovery − baseline HR (negative = settled) | bpm |
+| `sensor.lullhum_hr_baseline` | mean HR over the N min **before** | bpm |
+| `sensor.lullhum_hr_recovery` | mean HR over the N min **after** | bpm |
+| `sensor.lullhum_hr_avg` | mean HR **during** | bpm |
 | `sensor.lullhum_duration` | session length | s |
 | `sensor.lullhum_stress_baseline` / `_recovery` | Garmin stress before / after | — |
 | `sensor.lullhum_resp_baseline` / `_recovery` | respiration before / after | br/min |
 
-`hr_recovery_delta` is the headline: a consistently negative value across
-sessions is the signal that the app is having an effect. The `stress_*` /
-`resp_*` entities only appear when the device exposes those histories.
+`hr_recovery_delta` is the headline: consistently negative across sessions is the
+signal the app is having an effect. `stress_*` / `resp_*` appear only when the
+device exposes those histories. Entities send most-important-first, so if the
+background run is cut short the headline ones still land.
 
 - **Baseline** is read back from `SensorHistory` at session end (the configured
   minutes *before* you started).
 - **Recovery** can't be read until it happens, so a Connect IQ **background
-  service** registers a one-shot temporal event and wakes the configured minutes
-  *after* the session — even after you've closed the app.
+  service** wakes the configured minutes *after* the session — even after you've
+  closed the app — fills in the recovery values, and sends every entity.
 
 The recovery window has a hard **5-minute floor** (the platform's minimum for
 background temporal events). History resolution is coarser than live sampling
@@ -88,17 +91,16 @@ windows are averages, not high-res curves — fine for trend deltas.
 
 > **Delivery is background-only.** The app has no stop button — closing it *is*
 > "stop" — so an immediate send at session end would be cut off mid-queue (the
-> watch relays each POST through the phone over BLE, which is slow). Instead the
-> whole batch is persisted and sent **together with the recovery readings from
-> the post-session background wake** (~recovery-window minutes later). So expect
-> all metrics to appear in HA only after that delay, not right when you finish.
-> The metric set is deliberately small because the background process has a
-> ~30-second budget for the BLE-relayed POSTs.
+> watch relays each POST through the phone over BLE). Instead the session is
+> persisted and all entities are sent from the **post-session background wake**
+> (~recovery-window minutes later). So a session appears in HA after that delay,
+> not the moment you finish. The background process has a ~30-second budget, which
+> is why the metric set is small and ordered most-important-first.
 
-> **Note:** states set via the REST API aren't backed by an integration, so they
-> can't be attached to an HA **device** (only MQTT discovery / a custom
-> integration can do that), and they read `unknown` after a Home Assistant
-> restart until the next session repopulates them — recorded history is retained.
+> **Note:** states set via the REST API aren't backed by an integration, so the
+> entities can't be attached to an HA **device** (only MQTT discovery / a custom
+> integration can do that), and they read `unknown` after a Home Assistant restart
+> until the next session repopulates them — recorded history is retained.
 
 > **More proxies worth adding later:** beat-to-beat **HRV (RMSSD)** is the gold
 > standard for parasympathetic tone but has limited in-app access on most
