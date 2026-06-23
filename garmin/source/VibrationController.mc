@@ -29,6 +29,8 @@ class VibrationController {
     hidden var mMode = Config.MODE_ALTERNATING;
     hidden var mStartMs = 0;
     hidden var mSyncAnchor = 0;
+    hidden var mAltAnchorMs = 0; // System.getTimer() captured at the anchor buzz
+    hidden var mAltPeriod = 0;   // 2 * speed; the alternating grid spacing
     hidden var mPhases as Array<BreathPhase> = [];
     hidden var mPhaseIdx = 0;
     const SLOT_MS = 250; // breathing motif slot length
@@ -99,9 +101,25 @@ class VibrationController {
         if (!mRunning) { mSyncTimer.stop(); return; }
         if (Time.now().value() >= mSyncAnchor) {
             mSyncTimer.stop();
-            vibrate(100, altPulseMs()); // first watch buzz, on the anchor
-            mTimer.start(method(:onAltTick), 2 * Config.speedMs(), true);
+            mAltPeriod = 2 * Config.speedMs();
+            mAltAnchorMs = System.getTimer(); // ms-precise instant of the anchor
+            vibrate(100, altPulseMs());       // first watch buzz, on the anchor
+            scheduleNextAlt();
         }
+    }
+
+    // Re-anchor every buzz to the fixed monotonic grid (anchor + k*period) using
+    // System.getTimer(), the watch analog of the phone's wall-clock re-anchoring.
+    // A free-running repeating timer would drift across sleep/throttle and slide
+    // the watch onto the phone's slots, making both buzz at once; this keeps the
+    // watch locked to the same grid the phone aligns to, so they stay interleaved.
+    hidden function scheduleNextAlt() as Void {
+        if (!mRunning) { return; }
+        var now = System.getTimer();
+        var k = (now - mAltAnchorMs) / mAltPeriod + 1; // next slot strictly after now
+        var delay = (mAltAnchorMs + k * mAltPeriod) - now;
+        if (delay < 1) { delay = 1; }
+        mTimer.start(method(:onAltTick), delay, false); // one-shot; rescheduled each tick
     }
 
     function onAltTick() as Void {
@@ -111,7 +129,9 @@ class VibrationController {
         if (durMin > 0 && elapsedMs() >= durMin * 60000) {
             stop();
             WatchUi.requestUpdate();
+            return;
         }
+        scheduleNextAlt();
     }
 
     hidden function altPulseMs() as Number {
