@@ -4,23 +4,34 @@ using Toybox.WatchUi;
 // Owns the shared VibrationController so timing survives view transitions.
 class LullhumApp extends Application.AppBase {
 
-    hidden var mController as VibrationController;
+    hidden var mController as VibrationController?;
 
     function initialize() {
         AppBase.initialize();
         Config.load();
-        mController = new VibrationController();
     }
 
+    // Lazily created so the background service (recovery push) doesn't pull the
+    // whole vibration engine into its small memory budget.
     function getController() as VibrationController {
+        if (mController == null) {
+            mController = new VibrationController();
+        }
         return mController;
+    }
+
+    // Runs the post-session recovery read; see Metrics / BackgroundService.
+    function getServiceDelegate() {
+        return [ new BackgroundService() ];
     }
 
     function onStart(state) {
     }
 
     function onStop(state) {
-        mController.stop();
+        if (mController != null) {
+            mController.stop();
+        }
     }
 
     // Launch straight into the running screen; it auto-starts with the saved

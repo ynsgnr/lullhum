@@ -3,4 +3,9 @@
          under the app's Settings; both blank by default so metrics stay off. -->
     <property id="haUrl" type="string"></property>
     <property id="haToken" type="string"></property>
+    <!-- Minutes of pre-session history averaged as the baseline. -->
+    <property id="baselineMin" type="number">3</property>
+    <!-- Minutes after a session before the background recovery read; the
+         Connect IQ temporal-event floor is 5 minutes. -->
+    <property id="recoveryMin" type="number">5</property>
 </properties>

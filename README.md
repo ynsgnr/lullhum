@@ -47,6 +47,8 @@ app → Settings, or Connect IQ Store / Express):
 |---------|-------|
 | **Home Assistant URL** | e.g. `https://your-home.ui.nabu.casa` (must be HTTPS and reachable from wherever the phone has internet — the watch relays web requests through the phone's Garmin Connect app). |
 | **Long-lived access token** | HA → profile → *Long-lived access tokens* → Create. |
+| **Baseline window (min)** | Minutes of pre-session history averaged as the baseline (default 3). |
+| **Recovery window (min)** | Minutes after a session before the recovery is read (default/minimum 5). |
 
 Both blank by default, so nothing is sent until configured. At each session end
 (sessions under 30 s are skipped) the watch writes **one HA sensor entity per
@@ -68,6 +70,25 @@ The `resp_*` / `stress_*` entities only appear when the device exposes those
 histories. Plot any of them with a **Statistics graph** or **History** card; a
 falling `hr_delta` / `stress_delta` across sessions is the signal that the app
 is having an effect.
+
+**Baseline & recovery (before / after the session).** To measure *effect* rather
+than just in-session state, the app frames each session against the surrounding
+windows — and because Garmin logs HR/stress/respiration continuously, neither
+needs the app to be running:
+
+- **Baseline** is read back from `SensorHistory` at session end (the configured
+  minutes *before* you started) → `sensor.lullhum_hr_baseline`,
+  `stress_baseline`, `resp_baseline`.
+- **Recovery** can't be read until it happens, so a Connect IQ **background
+  service** registers a one-shot temporal event and wakes the configured minutes
+  *after* the session ends — even if you've exited the app — reads that window
+  and posts `sensor.lullhum_hr_recovery`, `hr_recovery_delta` (recovery −
+  baseline), `stress_recovery`, `resp_recovery`.
+
+The recovery window has a hard **5-minute floor** (the platform's minimum for
+background temporal events). History resolution is coarser than live sampling
+(Garmin stores HR every few minutes when you're not in an activity), so baseline
+and recovery are window averages, not high-res curves — fine for trend deltas.
 
 > **Note:** states set via the REST API aren't backed by an integration, so they
 > read `unknown` after a Home Assistant restart until the next session repopulates

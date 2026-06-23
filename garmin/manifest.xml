@@ -18,6 +18,7 @@
             <iq:uses-permission id="Communications" />
             <iq:uses-permission id="Sensor" />
             <iq:uses-permission id="SensorHistory" />
+            <iq:uses-permission id="Background" />
         </iq:permissions>
         <iq:languages>
             <iq:language>eng</iq:language>

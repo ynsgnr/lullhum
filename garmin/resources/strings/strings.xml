@@ -2,4 +2,6 @@
     <string id="AppName">Lullhum</string>
     <string id="SettingHaUrl">Home Assistant URL</string>
     <string id="SettingHaToken">Long-lived access token</string>
+    <string id="SettingBaseline">Baseline window (min)</string>
+    <string id="SettingRecovery">Recovery window (min, min 5)</string>
 </strings>

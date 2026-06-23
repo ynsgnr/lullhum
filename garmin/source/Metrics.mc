@@ -5,16 +5,18 @@ using Toybox.SensorHistory;
 using Toybox.Time;
 using Toybox.Time.Gregorian;
 using Toybox.Application;
+using Toybox.Application.Storage;
+using Toybox.Background;
 using Toybox.PersistedContent;
 
 // Per-session relaxation metrics pushed to Home Assistant.
 //
 // Heart rate is the primary proxy (lower / falling during a session suggests
 // parasympathetic activation). Respiration rate and Garmin's HRV-derived stress
-// score are captured at the start and end as stronger, lower-noise proxies for
-// nervous-system down-regulation. Nothing is sent unless the HA URL + token are
-// configured (Connect IQ app settings) and the session ran long enough to mean
-// something.
+// score are captured too as stronger, lower-noise proxies. To judge effect, each
+// session is framed against a baseline (the pre-session window, read back from
+// SensorHistory) and a recovery window (read minutes later by a background
+// service). Nothing is sent unless the HA URL + token are configured.
 module Metrics {
 
     // Sessions shorter than this are ignored (covers accidental starts and the
@@ -24,6 +26,7 @@ module Metrics {
     var active = false;
     var sessionType = "";
     var startSec = 0;
+    var endSec = 0;
 
     // Heart rate, accumulated live from sensor events.
     var hrStart = 0;
@@ -37,10 +40,11 @@ module Metrics {
     var respStart = null;
     var stressStart = null;
 
-    var endSec = 0;
     // Queue of one-per-metric POSTs, drained sequentially: Connect IQ only
     // reliably handles one web request at a time, so each fires the next.
     var pending = [];
+    // True while draining in the background service, so the last POST can exit it.
+    var bgMode = false;
 
     function onSessionStart(type as String) as Void {
         if (!configured()) { return; }
@@ -98,7 +102,76 @@ module Metrics {
             addMetric("stress_delta", "Lullhum stress delta", stressEnd - stressStart, null);
         }
 
+        // Baseline: Garmin logs HR even when the app isn't running, so the
+        // pre-session window can be read back from history retroactively.
+        var hrBaseline = avgHrInWindow(startSec - baselineWindowSec(), startSec);
+        if (hrBaseline != null) { addMetric("hr_baseline", "Lullhum HR baseline", hrBaseline, "bpm"); }
+        if (stressStart != null) { addMetric("stress_baseline", "Lullhum stress baseline", stressStart, null); }
+        if (respStart != null) { addMetric("resp_baseline", "Lullhum respiration baseline", respStart, "br/min"); }
+
+        // Recovery happens in the future, so hand it to a background service that
+        // wakes after the recovery window and reads it from history then.
+        scheduleRecovery(hrBaseline);
+
         sendNext();
+    }
+
+    // ---- Recovery (background) ---------------------------------------------
+
+    function scheduleRecovery(hrBaseline as Number?) as Void {
+        if (!(Toybox has :Background) || !(Background has :registerForTemporalEvent)) { return; }
+        if (baseUrl() == null) { return; }
+        var recSec = recoveryWindowSec();
+        Storage.setValue("rec_end", endSec);
+        Storage.setValue("rec_type", sessionType);
+        Storage.setValue("rec_win", recSec);
+        Storage.setValue("rec_hr_baseline", hrBaseline == null ? 0 : hrBaseline);
+        try {
+            Background.registerForTemporalEvent(new Time.Moment(endSec + recSec));
+        } catch (e) {
+            // e.g. an event is already scheduled; the latest session wins.
+        }
+    }
+
+    // Called from BackgroundService.onTemporalEvent once the recovery window has
+    // elapsed. Reads the post-session window from history and pushes it, then
+    // ends the background process.
+    function pushRecovery() as Void {
+        bgMode = true;
+        var recEnd = Storage.getValue("rec_end");
+        if (recEnd == null || baseUrl() == null) { finishBg(); return; }
+
+        var recSec = Storage.getValue("rec_win");
+        if (!(recSec instanceof Lang.Number)) { recSec = 300; }
+        var type = Storage.getValue("rec_type");
+        // Reuse start/end for the isoTime attributes: the recovery window itself.
+        sessionType = (type instanceof Lang.String) ? type : "";
+        startSec = recEnd;
+        endSec = recEnd + recSec;
+
+        pending = [];
+        var hrRec = avgHrInWindow(recEnd, recEnd + recSec);
+        if (hrRec != null) {
+            addMetric("hr_recovery", "Lullhum HR recovery", hrRec, "bpm");
+            var base = Storage.getValue("rec_hr_baseline");
+            if (base instanceof Lang.Number && base > 0) {
+                addMetric("hr_recovery_delta", "Lullhum HR recovery delta", hrRec - base, "bpm");
+            }
+        }
+        var stressRec = newestStress();
+        if (stressRec != null) { addMetric("stress_recovery", "Lullhum stress recovery", stressRec, null); }
+        var respRec = newestRespiration();
+        if (respRec != null) { addMetric("resp_recovery", "Lullhum respiration recovery", respRec, "br/min"); }
+
+        Storage.deleteValue("rec_end");
+        if (pending.size() == 0) { finishBg(); return; }
+        sendNext();
+    }
+
+    function finishBg() as Void {
+        if (bgMode && (Toybox has :Background)) {
+            Background.exit(null);
+        }
     }
 
     // ---- Home Assistant REST states API ------------------------------------
@@ -125,7 +198,7 @@ module Metrics {
         if (pending.size() == 0) { return; }
         var url = baseUrl();
         var token = Application.Properties.getValue("haToken");
-        if (url == null || token == null) { pending = []; return; }
+        if (url == null || token == null) { pending = []; finishBg(); return; }
         var item = pending[0];
         var options = {
             :method => Communications.HTTP_REQUEST_METHOD_POST,
@@ -143,6 +216,7 @@ module Metrics {
         // Drop the request just sent and chain the next, regardless of result;
         // the watch keeps working even if HA is unreachable.
         if (pending.size() > 0) { pending = pending.slice(1, null); }
+        if (pending.size() == 0) { finishBg(); return; }
         sendNext();
     }
 
@@ -162,6 +236,41 @@ module Metrics {
             u = u.substring(0, u.length() - 1);
         }
         return u.length() == 0 ? null : u;
+    }
+
+    function baselineWindowSec() as Number {
+        var m = Application.Properties.getValue("baselineMin");
+        var v = (m instanceof Lang.Number) ? m : 3;
+        if (v < 1) { v = 1; }
+        return v * 60;
+    }
+
+    function recoveryWindowSec() as Number {
+        var m = Application.Properties.getValue("recoveryMin");
+        var v = (m instanceof Lang.Number) ? m : 5;
+        if (v < 5) { v = 5; } // Connect IQ temporal-event floor.
+        return v * 60;
+    }
+
+    // Average HR over [fromSec, toSec] from stored history, or null if no
+    // samples fall in the window.
+    function avgHrInWindow(fromSec as Number, toSec as Number) as Number? {
+        if (!(Toybox has :SensorHistory) || !(SensorHistory has :getHeartRateHistory)) { return null; }
+        var span = Time.now().value() - fromSec + 60;
+        if (span < 1) { span = 1; }
+        var it = SensorHistory.getHeartRateHistory({ :period => new Time.Duration(span), :order => SensorHistory.ORDER_NEWEST_FIRST });
+        if (it == null) { return null; }
+        var sum = 0;
+        var n = 0;
+        var s = it.next();
+        while (s != null) {
+            if (s.data != null && s.when != null) {
+                var w = s.when.value();
+                if (w >= fromSec && w <= toSec) { sum += s.data; n++; }
+            }
+            s = it.next();
+        }
+        return (n > 0) ? sum / n : null;
     }
 
     function newestStress() as Number? {

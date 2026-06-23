@@ -5,4 +5,10 @@
     <setting propertyKey="@Properties.haToken" title="@Strings.SettingHaToken">
         <settingConfig type="alphaNumeric" />
     </setting>
+    <setting propertyKey="@Properties.baselineMin" title="@Strings.SettingBaseline">
+        <settingConfig type="numeric" min="1" max="30" />
+    </setting>
+    <setting propertyKey="@Properties.recoveryMin" title="@Strings.SettingRecovery">
+        <settingConfig type="numeric" min="5" max="60" />
+    </setting>
 </settings>
