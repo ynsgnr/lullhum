@@ -79,12 +79,13 @@ device exposes those histories. Entities send most-important-first, so if the
 background run is cut short the headline ones still land.
 
 **`sensor.lullhum_session` timeline.** Its state is set **live**: it flips to the
-mode at the real session start (app is open, so this is accurate) and to `idle`
-at the end, so the native History bar lines up with the actual session window.
-The end POST is best-effort — if you stop by *closing* the app it won't flush, so
-the background wake sets `idle` as a fallback (in that case the bar runs from the
-true start to roughly the background-wake time). The REST API can't backdate
-state changes, so the start/end *attributes* hold the exact times regardless.
+mode at the real session start and to `idle` at the end, so the native History bar
+lines up with the actual session window. Pressing **Back** to exit defers the app
+close by up to ~2 s so the `idle` request can leave first — so a normal exit ends
+the bar at the right time. If the app is instead killed by the system, the
+background wake sets `idle` as a fallback (the bar then runs from the true start to
+roughly the wake time). The REST API can't backdate state changes, so the
+start/end *attributes* hold the exact times regardless.
 
 - **Baseline** is read back from `SensorHistory` at session end (the configured
   minutes *before* you started).

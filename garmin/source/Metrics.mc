@@ -43,6 +43,9 @@ module Metrics {
     var bgMode = false;
     var pubStart = "";
     var pubEnd = "";
+    // Optional one-shot callback fired when the foreground send queue drains,
+    // used to defer app exit until the idle end-marker has actually been sent.
+    var mExitCb = null;
 
     function onSessionStart(type as String) as Void {
         if (!configured()) { return; }
@@ -247,8 +250,20 @@ module Metrics {
 
     function onPost(responseCode as Number, data as Null or Dictionary or String or PersistedContent.Iterator) as Void {
         if (pending.size() > 0) { pending = pending.slice(1, null); }
-        if (pending.size() == 0) { finishBg(); return; }
+        if (pending.size() == 0) {
+            if (mExitCb != null) { var cb = mExitCb; mExitCb = null; cb.invoke(); }
+            finishBg();
+            return;
+        }
         sendNext();
+    }
+
+    // Invoke cb once the foreground send queue has drained (used to defer app
+    // exit until the session's idle end-marker has been sent). Fires immediately
+    // if nothing is queued.
+    function flushThen(cb as Lang.Method) as Void {
+        if (pending.size() == 0) { cb.invoke(); return; }
+        mExitCb = cb;
     }
 
     // ---- Helpers -----------------------------------------------------------

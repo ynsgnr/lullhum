@@ -79,10 +79,13 @@ class RunningView extends WatchUi.View {
 
 class RunningDelegate extends WatchUi.BehaviorDelegate {
     hidden var mController as VibrationController;
+    hidden var mExitTimer as Timer.Timer;
+    hidden var mExited = false;
 
     function initialize() {
         BehaviorDelegate.initialize();
         mController = getController();
+        mExitTimer = new Timer.Timer();
     }
 
     // Physical select button.
@@ -103,11 +106,23 @@ class RunningDelegate extends WatchUi.BehaviorDelegate {
         return true;
     }
 
-    // Back exits the app (and stops vibration — it can't run once closed).
+    // Back exits the app (and stops vibration — it can't run once closed). Defer
+    // the exit briefly so the session's idle end-marker web request can leave
+    // before the app is torn down; whichever comes first — the send completing
+    // or a short timeout — actually exits.
     function onBack() {
+        if (mExited) { return true; }
         mController.stop();
-        WatchUi.popView(WatchUi.SLIDE_RIGHT);
+        mExitTimer.start(method(:doExit), 2000, false);
+        Metrics.flushThen(method(:doExit));
         return true;
+    }
+
+    function doExit() as Void {
+        if (mExited) { return; }
+        mExited = true;
+        mExitTimer.stop();
+        WatchUi.popView(WatchUi.SLIDE_RIGHT);
     }
 
     hidden function toggle() as Void {
