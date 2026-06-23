@@ -240,14 +240,14 @@ module Metrics {
 
     function baselineWindowSec() as Number {
         var m = Application.Properties.getValue("baselineMin");
-        var v = (m instanceof Lang.Number) ? m : 3;
+        var v = (m instanceof Lang.Number) ? m : 15;
         if (v < 1) { v = 1; }
         return v * 60;
     }
 
     function recoveryWindowSec() as Number {
         var m = Application.Properties.getValue("recoveryMin");
-        var v = (m instanceof Lang.Number) ? m : 5;
+        var v = (m instanceof Lang.Number) ? m : 15;
         if (v < 5) { v = 5; } // Connect IQ temporal-event floor.
         return v * 60;
     }

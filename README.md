@@ -47,8 +47,8 @@ app → Settings, or Connect IQ Store / Express):
 |---------|-------|
 | **Home Assistant URL** | e.g. `https://your-home.ui.nabu.casa` (must be HTTPS and reachable from wherever the phone has internet — the watch relays web requests through the phone's Garmin Connect app). |
 | **Long-lived access token** | HA → profile → *Long-lived access tokens* → Create. |
-| **Baseline window (min)** | Minutes of pre-session history averaged as the baseline (default 3). |
-| **Recovery window (min)** | Minutes after a session before the recovery is read (default/minimum 5). |
+| **Baseline window (min)** | Minutes of pre-session history averaged as the baseline (default 15). |
+| **Recovery window (min)** | Minutes after a session before the recovery is read (default 15, minimum 5). |
 
 Both blank by default, so nothing is sent until configured. At each session end
 (sessions under 30 s are skipped) the watch writes **one HA sensor entity per
