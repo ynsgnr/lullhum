@@ -47,7 +47,7 @@ class RunningView extends WatchUi.View {
 
         var running = mController.isRunning();
         dc.setColor(running ? Graphics.COLOR_GREEN : Graphics.COLOR_RED, Graphics.COLOR_BLACK);
-        dc.drawText(cx, h * 0.45, Graphics.FONT_MEDIUM, running ? "RUNNING" : "PAUSED", center);
+        dc.drawText(cx, h * 0.45, Graphics.FONT_MEDIUM, running ? "PULSING" : "PAUSED", center);
 
         dc.setColor(Graphics.COLOR_WHITE, Graphics.COLOR_BLACK);
         dc.drawText(cx, h * 0.60, Graphics.FONT_NUMBER_MILD, formatElapsed(), center);
