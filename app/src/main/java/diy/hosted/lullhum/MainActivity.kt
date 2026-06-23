@@ -132,7 +132,8 @@ private fun ReminderControls() {
         Text("Background reminder", fontSize = 18.sp, fontWeight = FontWeight.Medium)
         Spacer(Modifier.height(6.dp))
         Text(
-            "To buzz the watch: enable notifications and turn off Do Not Disturb on both watch and phone.",
+            "To buzz the watch: enable notifications and turn off Do Not Disturb on both watch and phone. " +
+                "For correct timing while locked, also disable battery optimisation for Lullhum.",
             fontSize = 12.sp,
             color = StatusGrey,
             textAlign = TextAlign.Center

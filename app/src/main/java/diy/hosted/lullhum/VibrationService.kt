@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -54,6 +55,7 @@ class VibrationService : Service() {
     private val handler = Handler(Looper.getMainLooper())
     private var vibrateRunnable: Runnable? = null
     private var sdkReady = false
+    private var wakeLock: PowerManager.WakeLock? = null
 
     private val vibrator: Vibrator by lazy {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -198,14 +200,22 @@ class VibrationService : Service() {
         val period = 2L * speedMs
         val pulse = minOf(speedMs.toLong(), MAX_PULSE_MS)
 
+        // A foreground service keeps the process alive but lets the CPU suspend
+        // with the screen off; the Handler runs on uptimeMillis, which freezes
+        // during that suspend, so without this the timer stalls and desyncs.
+        acquireWakeLock()
+
         val runnable = object : Runnable {
             override fun run() {
                 vibrateOnce(pulse)
-                handler.postDelayed(this, period)
+                // Re-anchor every tick to the shared wall clock so a single late
+                // buzz (e.g. after a brief CPU stall) self-corrects instead of
+                // drifting the rest of the session out of sync with the watch.
+                handler.postDelayed(this, nextBuzzDelay(anchorSec, speedMs.toLong(), period))
             }
         }
         vibrateRunnable = runnable
-        handler.postDelayed(runnable, firstBuzzDelay(anchorSec, speedMs.toLong(), period))
+        handler.postDelayed(runnable, nextBuzzDelay(anchorSec, speedMs.toLong(), period))
 
         LullhumState.set(Status.RUNNING)
         updateNotification()
@@ -213,21 +223,36 @@ class VibrationService : Service() {
 
     // Phone buzzes one interval after the watch's anchor buzz, then every 2*speed.
     // Aligning to the shared wall-clock anchor keeps the two interleaved despite
-    // BLE latency; if the anchor already passed, skip to the next valid slot.
-    private fun firstBuzzDelay(anchorSec: Long, speedMs: Long, period: Long): Long {
+    // BLE latency; from any "now" we pick the next valid slot at least 30ms out.
+    private fun nextBuzzDelay(anchorSec: Long, speedMs: Long, period: Long): Long {
         if (anchorSec <= 0) return period
         val now = System.currentTimeMillis()
-        var first = anchorSec * 1000L + speedMs
-        while (first < now + 30) first += period
-        return first - now
+        var next = anchorSec * 1000L + speedMs
+        while (next < now + 30) next += period
+        return next - now
     }
 
     private fun stopVibration() {
         vibrateRunnable?.let { handler.removeCallbacks(it) }
         vibrateRunnable = null
         vibrator.cancel()
+        releaseWakeLock()
         LullhumState.set(Status.STOPPED)
         updateNotification()
+    }
+
+    private fun acquireWakeLock() {
+        if (wakeLock?.isHeld == true) return
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$TAG:vibration").apply {
+            setReferenceCounted(false)
+            acquire()
+        }
+    }
+
+    private fun releaseWakeLock() {
+        wakeLock?.let { if (it.isHeld) it.release() }
+        wakeLock = null
     }
 
     private fun vibrateOnce(durationMs: Long) {

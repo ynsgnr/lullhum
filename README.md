@@ -60,6 +60,16 @@ listener alive with a persistent notification, listens for watch messages, and o
 `start` vibrates on even intervals only (offset one full interval from the watch).
 On `stop` or a dropped connection it cancels the timer.
 
+> **Locked-screen timing:** the alternating timer runs on the main looper, which
+> is paced by `uptimeMillis` and stops advancing once the CPU suspends — a
+> foreground service keeps the process alive but not the CPU. So while alternating
+> is active the service holds a `PARTIAL_WAKE_LOCK` (released on stop/drop) and
+> re-anchors every buzz to the shared wall clock, so a single late buzz
+> self-corrects instead of drifting out of sync. For this to work with the screen
+> off, **battery optimisation must be disabled for Lullhum** (Settings → Apps →
+> Lullhum → Battery → Unrestricted); aggressive OEM power management can otherwise
+> throttle the service or BLE and break sync.
+
 ### Background reminder
 
 The one way to buzz the watch while the Connect IQ app is **closed**: the phone
