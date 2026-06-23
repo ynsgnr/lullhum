@@ -37,6 +37,11 @@ module Metrics {
     var respStart = null;
     var stressStart = null;
 
+    var endSec = 0;
+    // Queue of one-per-metric POSTs, drained sequentially: Connect IQ only
+    // reliably handles one web request at a time, so each fires the next.
+    var pending = [];
+
     function onSessionStart(type as String) as Void {
         if (!configured()) { return; }
         active = true;
@@ -69,46 +74,59 @@ module Metrics {
         active = false;
         if (Sensor has :enableSensorEvents) { Sensor.enableSensorEvents(null); }
 
-        var endSec = Time.now().value();
+        endSec = Time.now().value();
         if (endSec - startSec < MIN_SESSION_SEC || hrCount == 0) { return; }
 
-        var hrAvg = hrSum / hrCount;
-        var attrs = {
-            "friendly_name" => "Lullhum session",
-            "unit_of_measurement" => "bpm",
-            "session_type" => sessionType,
-            "start" => isoTime(startSec),
-            "end" => isoTime(endSec),
-            "duration_sec" => endSec - startSec,
-            "hr_start" => hrStart,
-            "hr_end" => hrEnd,
-            "hr_avg" => hrAvg,
-            "hr_min" => hrMin,
-            "hr_max" => hrMax,
-            "hr_delta" => hrEnd - hrStart
-        };
+        // One real HA sensor entity per metric, each with state_class so HA's
+        // statistics engine plots it over time directly (no template sensors).
+        pending = [];
+        addMetric("hr_avg", "Lullhum HR avg", hrSum / hrCount, "bpm");
+        addMetric("hr_min", "Lullhum HR min", hrMin, "bpm");
+        addMetric("hr_max", "Lullhum HR max", hrMax, "bpm");
+        addMetric("hr_delta", "Lullhum HR delta", hrEnd - hrStart, "bpm");
+        addMetric("duration", "Lullhum duration", endSec - startSec, "s");
 
         var respEnd = newestRespiration();
-        if (respStart != null) { attrs.put("resp_start", respStart); }
-        if (respEnd != null) { attrs.put("resp_end", respEnd); }
-        if (respStart != null && respEnd != null) { attrs.put("resp_delta", respEnd - respStart); }
+        if (respEnd != null) { addMetric("resp_end", "Lullhum respiration", respEnd, "br/min"); }
+        if (respStart != null && respEnd != null) {
+            addMetric("resp_delta", "Lullhum respiration delta", respEnd - respStart, "br/min");
+        }
 
         var stressEnd = newestStress();
-        if (stressStart != null) { attrs.put("stress_start", stressStart); }
-        if (stressEnd != null) { attrs.put("stress_end", stressEnd); }
-        if (stressStart != null && stressEnd != null) { attrs.put("stress_delta", stressEnd - stressStart); }
+        if (stressEnd != null) { addMetric("stress_end", "Lullhum stress", stressEnd, null); }
+        if (stressStart != null && stressEnd != null) {
+            addMetric("stress_delta", "Lullhum stress delta", stressEnd - stressStart, null);
+        }
 
-        // hr_avg is the entity state so it graphs directly; the rest are
-        // attributes for HA template sensors / history.
-        post({ "state" => hrAvg, "attributes" => attrs });
+        sendNext();
     }
 
     // ---- Home Assistant REST states API ------------------------------------
 
-    function post(payload as Dictionary) as Void {
+    // Queue a POST that sets sensor.lullhum_<key> to a numeric state, tagged so
+    // HA records long-term statistics for it. session_type/start/end ride along
+    // as attributes for context.
+    function addMetric(key as String, name as String, value as Number, unit as String?) as Void {
+        var attrs = {
+            "friendly_name" => name,
+            "state_class" => "measurement",
+            "session_type" => sessionType,
+            "start" => isoTime(startSec),
+            "end" => isoTime(endSec)
+        };
+        if (unit != null) { attrs.put("unit_of_measurement", unit); }
+        pending.add({
+            "path" => "/api/states/sensor.lullhum_" + key,
+            "body" => { "state" => value, "attributes" => attrs }
+        });
+    }
+
+    function sendNext() as Void {
+        if (pending.size() == 0) { return; }
         var url = baseUrl();
         var token = Application.Properties.getValue("haToken");
-        if (url == null || token == null) { return; }
+        if (url == null || token == null) { pending = []; return; }
+        var item = pending[0];
         var options = {
             :method => Communications.HTTP_REQUEST_METHOD_POST,
             :headers => {
@@ -118,11 +136,14 @@ module Metrics {
             :responseType => Communications.HTTP_RESPONSE_CONTENT_TYPE_JSON
         };
         Communications.makeWebRequest(
-            url + "/api/states/sensor.lullhum_session", payload, options, new Lang.Method(Metrics, :onPost));
+            url + item["path"], item["body"], options, new Lang.Method(Metrics, :onPost));
     }
 
     function onPost(responseCode as Number, data as Null or Dictionary or String or PersistedContent.Iterator) as Void {
-        // Fire-and-forget; the watch keeps working regardless of HA's response.
+        // Drop the request just sent and chain the next, regardless of result;
+        // the watch keeps working even if HA is unreachable.
+        if (pending.size() > 0) { pending = pending.slice(1, null); }
+        sendNext();
     }
 
     // ---- Helpers -----------------------------------------------------------

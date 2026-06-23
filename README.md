@@ -49,13 +49,29 @@ app → Settings, or Connect IQ Store / Express):
 | **Long-lived access token** | HA → profile → *Long-lived access tokens* → Create. |
 
 Both blank by default, so nothing is sent until configured. At each session end
-(sessions under 30 s are skipped) the watch does a single
-`POST /api/states/sensor.lullhum_session` with `Authorization: Bearer <token>`.
-The entity **state** is `hr_avg` (so it graphs directly); the rest ride in
-attributes: `session_type`, `start`/`end` (ISO 8601 UTC), `duration_sec`,
-`hr_start`/`hr_end`/`hr_min`/`hr_max`/`hr_delta`, and `resp_*` / `stress_*`
-start/end/delta when the device exposes them. Split them into individual history
-graphs with HA template sensors if you want per-metric trends.
+(sessions under 30 s are skipped) the watch writes **one HA sensor entity per
+metric** via `POST /api/states/sensor.lullhum_<metric>` (`Authorization: Bearer
+<token>`), sent sequentially. Each carries `state_class: measurement` so HA's
+statistics engine plots it over time directly — **no template sensors needed**.
+`session_type` and `start`/`end` (ISO 8601 UTC) ride along as attributes.
+
+| Entity | Meaning | Unit |
+|--------|---------|------|
+| `sensor.lullhum_hr_avg` | mean HR over the session | bpm |
+| `sensor.lullhum_hr_min` / `_max` | HR range | bpm |
+| `sensor.lullhum_hr_delta` | end − start HR (negative = settling) | bpm |
+| `sensor.lullhum_duration` | session length | s |
+| `sensor.lullhum_resp_end` / `_delta` | respiration rate + change | br/min |
+| `sensor.lullhum_stress_end` / `_delta` | Garmin stress + change | — |
+
+The `resp_*` / `stress_*` entities only appear when the device exposes those
+histories. Plot any of them with a **Statistics graph** or **History** card; a
+falling `hr_delta` / `stress_delta` across sessions is the signal that the app
+is having an effect.
+
+> **Note:** states set via the REST API aren't backed by an integration, so they
+> read `unknown` after a Home Assistant restart until the next session repopulates
+> them — recorded history is retained.
 
 > **More proxies worth adding later:** beat-to-beat **HRV (RMSSD)** is the gold
 > standard for parasympathetic tone but has limited in-app access on most
