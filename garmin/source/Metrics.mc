@@ -38,7 +38,10 @@ module Metrics {
 
     // Send queue, drained sequentially in the background; bgMode lets the final
     // callback end the background process. pubStart/pubEnd are the session window
-    // (ISO) attached to every entity for context.
+    // (ISO) attached to every entity for context. In bgMode the queue is mirrored
+    // to Storage (PENDING_QUEUE) so a wake that gets killed before draining can be
+    // resumed by the next scheduled wake — see scheduleDrainRetry / pushRecovery.
+    const PENDING_QUEUE = "pending_queue";
     var pending = [];
     var bgMode = false;
     var pubStart = "";
@@ -125,6 +128,18 @@ module Metrics {
     // Ordered most-important-first so a background timeout drops only the tail.
     function pushRecovery() as Void {
         bgMode = true;
+
+        // Resume an in-progress drain: a previous wake can be killed (CIQ caps a
+        // background process's wall-clock time) before the whole queue is sent.
+        // The remaining, fully-formed POSTs were persisted, so just keep draining.
+        var resume = Storage.getValue(PENDING_QUEUE);
+        if (resume instanceof Lang.Array && resume.size() > 0) {
+            pending = resume;
+            scheduleDrainRetry(); // re-arm in case this wake is also cut short
+            sendNext();
+            return;
+        }
+
         var rec = Storage.getValue("pending_session");
         if (!(rec instanceof Lang.Dictionary) || baseUrl() == null) { finishBg(); return; }
 
@@ -162,12 +177,42 @@ module Metrics {
 
         Storage.deleteValue("pending_session");
         if (pending.size() == 0) { finishBg(); return; }
+        // Persist the queue and schedule a follow-up wake before sending: if this
+        // process dies mid-drain, the next wake resumes from the saved queue.
+        saveQueue();
+        scheduleDrainRetry();
         sendNext();
     }
 
     function finishBg() as Void {
         if (bgMode && (Toybox has :Background)) {
             Background.exit(null);
+        }
+    }
+
+    // Mirror the live queue to Storage so a killed wake can resume (bgMode only;
+    // the foreground postMode path must not leave a queue for a wake to pick up).
+    function saveQueue() as Void {
+        if (bgMode) { Storage.setValue(PENDING_QUEUE, pending); }
+    }
+
+    // Queue fully sent: drop the saved copy and cancel the follow-up wake so no
+    // further background process spins up.
+    function clearDrainState() as Void {
+        Storage.deleteValue(PENDING_QUEUE);
+        if ((Toybox has :Background) && (Background has :deleteTemporalEvent)) {
+            try { Background.deleteTemporalEvent(); } catch (e) {}
+        }
+    }
+
+    // Schedule the next wake to keep draining. Replaces any pending temporal event
+    // (CIQ allows one); the recovery event has already fired by the time we drain.
+    // The 5-minute floor is the CIQ temporal-event minimum.
+    function scheduleDrainRetry() as Void {
+        if (!(Toybox has :Background) || !(Background has :registerForTemporalEvent)) { return; }
+        try {
+            Background.registerForTemporalEvent(new Time.Moment(Time.now().value() + 300));
+        } catch (e) {
         }
     }
 
@@ -234,7 +279,12 @@ module Metrics {
         if (pending.size() == 0) { finishBg(); return; }
         var url = baseUrl();
         var token = Application.Properties.getValue("haToken");
-        if (url == null || token == null) { pending = []; finishBg(); return; }
+        if (url == null || token == null) {
+            pending = [];
+            if (bgMode) { clearDrainState(); }
+            finishBg();
+            return;
+        }
         var item = pending[0];
         var options = {
             :method => Communications.HTTP_REQUEST_METHOD_POST,
@@ -250,8 +300,10 @@ module Metrics {
 
     function onPost(responseCode as Number, data as Null or Dictionary or String or PersistedContent.Iterator) as Void {
         if (pending.size() > 0) { pending = pending.slice(1, null); }
+        saveQueue(); // checkpoint progress so a kill resumes from here, not the top
         if (pending.size() == 0) {
             if (mExitCb != null) { var cb = mExitCb; mExitCb = null; cb.invoke(); }
+            if (bgMode) { clearDrainState(); }
             finishBg();
             return;
         }
