@@ -134,9 +134,13 @@ class VibrationController {
         scheduleNextAlt();
     }
 
+    // ~40% of one interval, clamped. Kept well under the interval so a clear
+    // silent gap stays open before the phone's offset buzz, even with some
+    // watch/phone clock skew — the wider that gap, the less likely the two
+    // merge into one felt buzz (the failure was worst at Fast).
     hidden function altPulseMs() as Number {
-        var p = Config.speedMs() / 2;
-        return p > 300 ? 300 : (p < 100 ? 100 : p);
+        var p = Config.speedMs() * 2 / 5;
+        return p > 200 ? 200 : (p < 80 ? 80 : p);
     }
 
     function onIntervalTick() as Void {

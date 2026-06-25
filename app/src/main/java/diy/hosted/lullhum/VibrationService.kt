@@ -39,7 +39,10 @@ class VibrationService : Service() {
         // Must match the Connect IQ app id in garmin/manifest.xml.
         private const val IQ_APP_ID = "f1e2d3c4b5a697887766554433221100"
 
-        // Phone pulse length is capped so fast speeds stay crisp.
+        // Phone pulse is kept short — well under one interval — so a clear silent
+        // gap stays open between the watch's buzz and the phone's even with some
+        // clock skew. Floored so it's still perceptible, capped so it stays crisp.
+        private const val MIN_PULSE_MS = 80L
         private const val MAX_PULSE_MS = 200L
 
         const val ACTION_START_REMINDER = "diy.hosted.lullhum.START_REMINDER"
@@ -198,7 +201,23 @@ class VibrationService : Service() {
     private fun startVibration(speedMs: Int, anchorSec: Long) {
         stopVibration()
         val period = 2L * speedMs
-        val pulse = minOf(speedMs.toLong(), MAX_PULSE_MS)
+        // ~40% of one interval, clamped: leaves a silent gap of at least ~60% of
+        // the interval before the watch's next buzz (vs. only ~50ms at Fast when
+        // the pulse ran the full 200ms), so clock skew is far less likely to merge
+        // the two into one felt buzz.
+        val pulse = (speedMs * 2L / 5L).coerceIn(MIN_PULSE_MS, MAX_PULSE_MS)
+
+        // The shared anchor is what keeps the phone interleaved with the watch. If
+        // it's somehow missing, do NOT silently free-run from message arrival —
+        // that's exactly how the two drift into buzzing together. Log it (so the
+        // desync is diagnosable) and anchor to the current whole second, which at
+        // least keeps the phone on a defined half-period grid.
+        val anchor = if (anchorSec > 0) {
+            anchorSec
+        } else {
+            Log.w(TAG, "start message had no anchor; phone alternation may not align with the watch")
+            System.currentTimeMillis() / 1000L
+        }
 
         // A foreground service keeps the process alive but lets the CPU suspend
         // with the screen off; the Handler runs on uptimeMillis, which freezes
@@ -211,11 +230,11 @@ class VibrationService : Service() {
                 // Re-anchor every tick to the shared wall clock so a single late
                 // buzz (e.g. after a brief CPU stall) self-corrects instead of
                 // drifting the rest of the session out of sync with the watch.
-                handler.postDelayed(this, nextBuzzDelay(anchorSec, speedMs.toLong(), period))
+                handler.postDelayed(this, nextBuzzDelay(anchor, speedMs.toLong(), period))
             }
         }
         vibrateRunnable = runnable
-        handler.postDelayed(runnable, nextBuzzDelay(anchorSec, speedMs.toLong(), period))
+        handler.postDelayed(runnable, nextBuzzDelay(anchor, speedMs.toLong(), period))
 
         LullhumState.set(Status.RUNNING)
         updateNotification()
@@ -224,8 +243,8 @@ class VibrationService : Service() {
     // Phone buzzes one interval after the watch's anchor buzz, then every 2*speed.
     // Aligning to the shared wall-clock anchor keeps the two interleaved despite
     // BLE latency; from any "now" we pick the next valid slot at least 30ms out.
+    // The caller guarantees anchorSec > 0 (see startVibration).
     private fun nextBuzzDelay(anchorSec: Long, speedMs: Long, period: Long): Long {
-        if (anchorSec <= 0) return period
         val now = System.currentTimeMillis()
         var next = anchorSec * 1000L + speedMs
         while (next < now + 30) next += period
