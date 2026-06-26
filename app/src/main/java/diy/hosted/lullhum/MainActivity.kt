@@ -22,8 +22,10 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.OutlinedButton
@@ -93,32 +95,32 @@ fun StatusScreen(modifier: Modifier = Modifier) {
     Column(
         modifier = modifier
             .fillMaxSize()
+            .verticalScroll(rememberScrollState())
             .padding(24.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        Text("Lullhum", fontSize = 28.sp, fontWeight = FontWeight.Bold)
-        Spacer(Modifier.height(24.dp))
-        StatusIndicator(status)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Lullhum", fontSize = 28.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.width(10.dp))
+            Box(Modifier.size(12.dp).clip(CircleShape).background(statusColor(status)))
+        }
         Spacer(Modifier.height(32.dp))
         HorizontalDivider()
         Spacer(Modifier.height(24.dp))
         ReminderControls()
+        Spacer(Modifier.height(24.dp))
+        HorizontalDivider()
+        Spacer(Modifier.height(24.dp))
+        PairControls()
     }
 }
 
-@Composable
-private fun StatusIndicator(status: Status) {
-    val color = when (status) {
-        Status.RUNNING -> StatusGreen
-        Status.STOPPED -> StatusBlue
-        Status.DISCONNECTED -> StatusGrey
-    }
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Box(Modifier.size(56.dp).clip(CircleShape).background(color))
-        Spacer(Modifier.height(16.dp))
-        Text(status.label, fontSize = 20.sp, color = color, fontWeight = FontWeight.Medium)
-    }
+// Watch-connection status as a colour for the dot beside the header.
+private fun statusColor(status: Status): Color = when (status) {
+    Status.RUNNING -> StatusGreen
+    Status.STOPPED -> StatusBlue
+    Status.DISCONNECTED -> StatusGrey
 }
 
 @Composable
@@ -191,5 +193,66 @@ private fun IntervalChip(min: Int, selected: Boolean, enabled: Boolean, onClick:
 private fun sendReminder(ctx: Context, action: String, intervalMin: Int = 0) {
     val intent = Intent(ctx, VibrationService::class.java).setAction(action)
     if (intervalMin > 0) intent.putExtra(VibrationService.EXTRA_INTERVAL_MIN, intervalMin)
+    ContextCompat.startForegroundService(ctx, intent)
+}
+
+/**
+ * Two-phone alternating: set one phone to Pair 1 and another to Pair 2, press Start
+ * on both, and they buzz in alternation off the shared wall clock — no watch, BLE,
+ * or pairing involved (see [VibrationService.startPair]).
+ */
+@Composable
+private fun PairControls() {
+    val ctx = LocalContext.current
+    val active by LullhumState.pairActive.collectAsState()
+    val activeRole by LullhumState.pairRole.collectAsState()
+    var role by remember { mutableStateOf(1) }
+    val shownRole = if (active) activeRole else role
+
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text("Two-phone pairs", fontSize = 18.sp, fontWeight = FontWeight.Medium)
+        Spacer(Modifier.height(6.dp))
+        Text(
+            "Use two phones instead of a watch. Set one to Pair 1 and the other to Pair 2, then " +
+                "press Start on both — they alternate (Pair 1, then Pair 2 half a second later). No " +
+                "pairing needed; alignment relies on both phones' clocks, so keep automatic date & time on.",
+            fontSize = 12.sp,
+            color = StatusGrey,
+            textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(12.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            PairChip("Pair 1", selected = shownRole == 1, enabled = !active) { role = 1 }
+            PairChip("Pair 2", selected = shownRole == 2, enabled = !active) { role = 2 }
+        }
+        Spacer(Modifier.height(16.dp))
+        Button(
+            onClick = {
+                if (active) sendPair(ctx, VibrationService.ACTION_STOP_PAIR)
+                else sendPair(ctx, VibrationService.ACTION_START_PAIR, role)
+            },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(if (active) "Stop" else "Start")
+        }
+        if (active) {
+            Spacer(Modifier.height(8.dp))
+            Text("Vibrating as Pair $activeRole", fontSize = 14.sp, color = StatusGreen)
+        }
+    }
+}
+
+@Composable
+private fun PairChip(label: String, selected: Boolean, enabled: Boolean, onClick: () -> Unit) {
+    if (selected) {
+        Button(onClick = onClick, enabled = enabled) { Text(label) }
+    } else {
+        OutlinedButton(onClick = onClick, enabled = enabled) { Text(label) }
+    }
+}
+
+private fun sendPair(ctx: Context, action: String, pair: Int = 0) {
+    val intent = Intent(ctx, VibrationService::class.java).setAction(action)
+    if (pair > 0) intent.putExtra(VibrationService.EXTRA_PAIR, pair)
     ContextCompat.startForegroundService(ctx, intent)
 }

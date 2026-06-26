@@ -1,5 +1,7 @@
 import Toybox.Lang;
 using Toybox.Communications;
+using Toybox.Math;
+using Toybox.System;
 using Toybox.Sensor;
 using Toybox.SensorHistory;
 using Toybox.Time;
@@ -28,9 +30,33 @@ module Metrics {
     var startSec = 0;
     var endSec = 0;
 
-    // Heart rate, accumulated live from sensor events.
+    // Heart rate, accumulated live from sensor events. hrMin tracks the lowest
+    // beat seen during the session (-1 until the first sample).
     var hrSum = 0;
     var hrCount = 0;
+    var hrMin = -1;
+
+    // HRV (RMSSD, ms) computed live from beat-to-beat R-R intervals delivered by
+    // Sensor.registerSensorDataListener. The platform exposes no HRV *history*, and
+    // the R-R listener only runs in the foreground, so there's no true pre-session
+    // or post-recovery beat-to-beat HRV to read. Instead we window the live stream:
+    //   start  = first HRV_START_SEC of the session ("before"/settling-in)
+    //   avg    = the whole session ("during")
+    //   end    = roughly the last minute or two ("after"/end-of-session)
+    // A rising RMSSD start -> end is parasympathetic activation. RMSSD = sqrt(mean
+    // of squared successive R-R differences); we accumulate the squared diffs in
+    // O(1) memory (no buffers) with two rolling 60 s buckets approximating the end.
+    const HRV_START_SEC = 60;
+    const HRV_BUCKET_SEC = 60;
+    // Plausible adult R-R interval band (ms); anything outside is an artefact.
+    const RR_MIN_MS = 300;
+    const RR_MAX_MS = 2000;
+    var mLastRr = 0;            // previous accepted R-R, for successive differences
+    var hrvSqAll = 0;  var hrvNAll = 0;   // whole session
+    var hrvSqStart = 0; var hrvNStart = 0; // first window
+    var hrvSqCur = 0;  var hrvNCur = 0;    // current 60 s bucket (end estimate)
+    var hrvSqPrev = 0; var hrvNPrev = 0;   // previous 60 s bucket
+    var hrvBucketEdge = 0;     // session-seconds boundary of the current bucket
 
     // Respiration / stress baselines, sampled from history at start.
     var respStart = null;
@@ -41,7 +67,14 @@ module Metrics {
     // (ISO) attached to every entity for context. In bgMode the queue is mirrored
     // to Storage (PENDING_QUEUE) so a wake that gets killed before draining can be
     // resumed by the next scheduled wake — see scheduleDrainRetry / pushRecovery.
-    const PENDING_QUEUE = "pending_queue";
+    const PENDING_QUEUE = "pending_queue";     // remaining POSTs (survives a killed wake)
+    const PENDING_SESSION = "pending_session"; // the stashed session, until its queue drains
+    // A queue item that keeps failing to send (e.g. a malformed entity, or HA
+    // unreachable for hours) is dropped after this many delivery attempts so it
+    // can't pin the queue and respawn a background wake forever. Each item carries
+    // its own attempt count (TRIES_KEY) across wakes via the persisted queue.
+    const MAX_TRIES = 8;
+    const TRIES_KEY = "t";
     var pending = [];
     var bgMode = false;
     var pubStart = "";
@@ -55,12 +88,24 @@ module Metrics {
         active = true;
         sessionType = type;
         startSec = Time.now().value();
-        hrSum = 0; hrCount = 0;
+        hrSum = 0; hrCount = 0; hrMin = -1;
+        resetHrv();
         respStart = newestRespiration();
         stressStart = newestStress();
         if (Sensor has :setEnabledSensors) {
             Sensor.setEnabledSensors([Sensor.SENSOR_HEARTRATE]);
             Sensor.enableSensorEvents(new Lang.Method(Metrics, :onSensor));
+        }
+        // Separately stream beat-to-beat R-R intervals for live HRV. If this and
+        // the 1 Hz HR events can't coexist on a given device, onSessionEnd falls
+        // back to a history-derived HR average, so the session still records.
+        if (Sensor has :registerSensorDataListener) {
+            try {
+                Sensor.registerSensorDataListener(
+                    new Lang.Method(Metrics, :onSensorData),
+                    { :period => 1, :heartBeatIntervals => { :enabled => true } });
+            } catch (e) {
+            }
         }
         // Mark the real session start now (app is foreground), so the mode
         // entity's native History bar begins at the true time.
@@ -73,16 +118,69 @@ module Metrics {
         if (hr != null && hr > 0) {
             hrSum += hr;
             hrCount++;
+            if (hrMin < 0 || hr < hrMin) { hrMin = hr; }
         }
+    }
+
+    function resetHrv() as Void {
+        mLastRr = 0;
+        hrvSqAll = 0; hrvNAll = 0;
+        hrvSqStart = 0; hrvNStart = 0;
+        hrvSqCur = 0; hrvNCur = 0;
+        hrvSqPrev = 0; hrvNPrev = 0;
+        hrvBucketEdge = HRV_BUCKET_SEC;
+    }
+
+    // Batched R-R intervals (ms) since the last callback. Each accepted interval
+    // contributes its squared difference from the previous one to the running
+    // RMSSD accumulators (whole session, first window, rolling end buckets).
+    function onSensorData(data as Sensor.SensorData) as Void {
+        if (!active || data == null) { return; }
+        var hrData = data.heartRateData;
+        if (hrData == null) { return; }
+        var rrs = hrData.heartBeatIntervals;
+        if (rrs == null) { return; }
+        var elapsed = Time.now().value() - startSec;
+        // Roll the 60 s end-buckets forward to cover the current session time.
+        while (elapsed >= hrvBucketEdge) {
+            hrvSqPrev = hrvSqCur; hrvNPrev = hrvNCur;
+            hrvSqCur = 0; hrvNCur = 0;
+            hrvBucketEdge += HRV_BUCKET_SEC;
+        }
+        for (var i = 0; i < rrs.size(); i++) {
+            var rr = rrs[i];
+            if (rr == null || rr < RR_MIN_MS || rr > RR_MAX_MS) { mLastRr = 0; continue; }
+            if (mLastRr > 0) {
+                var d = rr - mLastRr;
+                var sq = d * d;
+                hrvSqAll += sq; hrvNAll++;
+                if (elapsed <= HRV_START_SEC) { hrvSqStart += sq; hrvNStart++; }
+                hrvSqCur += sq; hrvNCur++;
+            }
+            mLastRr = rr;
+        }
+    }
+
+    // RMSSD over an accumulated (sum-of-squared-diffs, count) pair, rounded to a
+    // whole millisecond, or null when there were too few intervals to be meaningful.
+    function rmssd(sumSq as Number, n as Number) as Number? {
+        if (n < 2) { return null; }
+        return Math.round(Math.sqrt(sumSq.toFloat() / n)).toNumber();
     }
 
     function onSessionEnd() as Void {
         if (!active) { return; }
         active = false;
         if (Sensor has :enableSensorEvents) { Sensor.enableSensorEvents(null); }
+        if (Sensor has :unregisterSensorDataListener) {
+            try { Sensor.unregisterSensorDataListener(); } catch (e) {}
+        }
 
         endSec = Time.now().value();
-        if (endSec - startSec < MIN_SESSION_SEC || hrCount == 0) {
+        // Live HR may be empty if the R-R listener preempted the 1 Hz events on this
+        // device; fall back to the session window from history so we still record.
+        var hrAvg = (hrCount > 0) ? hrSum / hrCount : avgHrInWindow(startSec, endSec);
+        if (endSec - startSec < MIN_SESSION_SEC || hrAvg == null) {
             postMode("idle", isoTime(startSec), isoTime(endSec)); // close the bar
             return;
         }
@@ -98,12 +196,19 @@ module Metrics {
         rec.put("end_epoch", endSec);
         rec.put("rec_win", recoveryWindowSec());
         rec.put("duration_sec", endSec - startSec);
-        rec.put("hr_avg", hrSum / hrCount);
+        rec.put("hr_avg", hrAvg);
+        if (hrCount > 0 && hrMin > 0) { rec.put("hr_min", hrMin); }
+        var hrvStart = rmssd(hrvSqStart, hrvNStart);
+        var hrvAll = rmssd(hrvSqAll, hrvNAll);
+        var hrvEnd = rmssd(hrvSqPrev + hrvSqCur, hrvNPrev + hrvNCur);
+        if (hrvStart != null) { rec.put("hrv_start", hrvStart); }
+        if (hrvAll != null) { rec.put("hrv_avg", hrvAll); }
+        if (hrvEnd != null) { rec.put("hrv_end", hrvEnd); }
         var hrBaseline = avgHrInWindow(startSec - baselineWindowSec(), startSec);
-        if (hrBaseline != null) { rec.put("hr_baseline", hrBaseline); }
-        if (stressStart != null) { rec.put("stress_baseline", stressStart); }
-        if (respStart != null) { rec.put("resp_baseline", respStart); }
-        Storage.setValue("pending_session", rec);
+        if (hrBaseline != null) { rec.put("hr_baseline", hrBaseline); } else { log("baseline HR null (no history before start)"); }
+        if (stressStart != null) { rec.put("stress_baseline", stressStart); } else { log("baseline stress null"); }
+        if (respStart != null) { rec.put("resp_baseline", respStart); } else { log("baseline respiration null"); }
+        Storage.setValue(PENDING_SESSION, rec);
         registerRecovery();
         // Best-effort live close (flushes if the app stays open, e.g. a timed
         // session completing); if you stop by closing the app it won't flush, so
@@ -124,8 +229,9 @@ module Metrics {
     }
 
     // Called from BackgroundService.onTemporalEvent once the recovery window has
-    // elapsed: reads the recovery window from history and sends every entity.
-    // Ordered most-important-first so a background timeout drops only the tail.
+    // elapsed: reads the recovery window from history and queues every entity,
+    // cheap-captured ones first then the recovery deltas, so a background timeout
+    // drops only the weaker tail. Resumes a half-sent queue from a prior wake.
     function pushRecovery() as Void {
         bgMode = true;
 
@@ -140,48 +246,87 @@ module Metrics {
             return;
         }
 
-        var rec = Storage.getValue("pending_session");
+        var rec = Storage.getValue(PENDING_SESSION);
         if (!(rec instanceof Lang.Dictionary) || baseUrl() == null) { finishBg(); return; }
 
         sessionType = rec.get("mode");
         pubStart = rec.get("start");
         pubEnd = rec.get("end");
 
-        var hrBaseline = rec.get("hr_baseline");
-        var hrRec = null;
-        var recEnd = rec.get("end_epoch");
-        if (recEnd instanceof Lang.Number) {
-            var winSec = rec.get("rec_win");
-            if (!(winSec instanceof Lang.Number)) { winSec = 900; }
-            hrRec = avgHrInWindow(recEnd, recEnd + winSec);
-        }
+        // Read the post-session recovery values from history (the slow part). null
+        // when the device logged nothing in the window — skipped, and logged.
+        var hrBase = rec.get("hr_baseline");
+        var hrRec = recoveryHr(rec);
+        var stressBase = rec.get("stress_baseline");
+        var stressRec = newestStress();
+        var respBase = rec.get("resp_baseline");
+        var respRec = newestRespiration();
+        if (hrRec == null) { log("recovery HR null (no history in window)"); }
+        if (stressRec == null) { log("recovery stress null"); }
+        if (respRec == null) { log("recovery respiration null"); }
 
         pending = [];
+
+        // Cheap, always-present group first: close the bar and emit everything
+        // captured in the foreground, so it lands even if the history reads above
+        // came back empty or this wake is cut short before the recovery group.
         addSessionClose(rec);  // close the mode bar (fallback if live end didn't flush)
-        if (hrRec != null && hrBaseline instanceof Lang.Number) {
-            addMetric("hr_recovery_delta", "Lullhum HR recovery delta", hrRec - hrBaseline, "bpm");
+        addNum("hr_avg", "Lullhum HR avg", rec.get("hr_avg"), "bpm");
+        addNum("hr_min", "Lullhum HR min", rec.get("hr_min"), "bpm");
+        addNum("duration", "Lullhum duration", rec.get("duration_sec"), "s");
+        addNum("hrv_avg", "Lullhum HRV avg", rec.get("hrv_avg"), "ms");
+        addNum("hrv_start", "Lullhum HRV start", rec.get("hrv_start"), "ms");
+        addNum("hrv_end", "Lullhum HRV end", rec.get("hrv_end"), "ms");
+        addNum("hr_baseline", "Lullhum HR baseline", hrBase, "bpm");
+
+        // Recovery group: each family leads with its delta (recovery - baseline;
+        // negative = settled), the headline signal, so a cut-short tail drops only
+        // the weaker raw before/after readings.
+        addDelta("hr_recovery_delta", "Lullhum HR recovery delta", hrRec, hrBase, "bpm");
+        addNum("hr_recovery", "Lullhum HR recovery", hrRec, "bpm");
+        addDelta("stress_delta", "Lullhum stress delta", stressRec, stressBase, null);
+        addNum("stress_baseline", "Lullhum stress baseline", stressBase, null);
+        addNum("stress_recovery", "Lullhum stress recovery", stressRec, null);
+        addDelta("resp_delta", "Lullhum respiration delta", respRec, respBase, "br/min");
+        addNum("resp_baseline", "Lullhum respiration baseline", respBase, "br/min");
+        addNum("resp_recovery", "Lullhum respiration recovery", respRec, "br/min");
+
+        if (pending.size() == 0) {
+            // Nothing to send (URL/token gone, or no usable data) — clear state so
+            // we don't rebuild an empty queue on every future wake.
+            clearDrainState();
+            finishBg();
+            return;
         }
-        if (hrBaseline instanceof Lang.Number) { addMetric("hr_baseline", "Lullhum HR baseline", hrBaseline, "bpm"); }
-        if (hrRec != null) { addMetric("hr_recovery", "Lullhum HR recovery", hrRec, "bpm"); }
-        addMetric("hr_avg", "Lullhum HR avg", rec.get("hr_avg"), "bpm");
-        addMetric("duration", "Lullhum duration", rec.get("duration_sec"), "s");
-
-        var stressBase = rec.get("stress_baseline");
-        if (stressBase != null) { addMetric("stress_baseline", "Lullhum stress baseline", stressBase, null); }
-        var stressRec = newestStress();
-        if (stressRec != null) { addMetric("stress_recovery", "Lullhum stress recovery", stressRec, null); }
-        var respBase = rec.get("resp_baseline");
-        if (respBase != null) { addMetric("resp_baseline", "Lullhum respiration baseline", respBase, "br/min"); }
-        var respRec = newestRespiration();
-        if (respRec != null) { addMetric("resp_recovery", "Lullhum respiration recovery", respRec, "br/min"); }
-
-        Storage.deleteValue("pending_session");
-        if (pending.size() == 0) { finishBg(); return; }
         // Persist the queue and schedule a follow-up wake before sending: if this
         // process dies mid-drain, the next wake resumes from the saved queue.
+        // pending_session is left in place; only the final onPost deletes both.
         saveQueue();
         scheduleDrainRetry();
         sendNext();
+    }
+
+    // Queue a numeric entity, skipping absent (null / non-number) values so a
+    // device that doesn't expose a given metric simply omits it.
+    function addNum(key as String, name as String, value, unit as String?) as Void {
+        if (value instanceof Lang.Number) { addMetric(key, name, value, unit); }
+    }
+
+    // Queue a recovery-minus-baseline delta, only when both ends are present.
+    function addDelta(key as String, name as String, recVal, baseVal, unit as String?) as Void {
+        if (recVal instanceof Lang.Number && baseVal instanceof Lang.Number) {
+            addMetric(key, name, recVal - baseVal, unit);
+        }
+    }
+
+    // Mean HR over the recovery window that opens at the session's end, read from
+    // history. null if the record lacks an end time or no samples were logged.
+    function recoveryHr(rec as Dictionary) as Number? {
+        var recEnd = rec.get("end_epoch");
+        if (!(recEnd instanceof Lang.Number)) { return null; }
+        var winSec = rec.get("rec_win");
+        if (!(winSec instanceof Lang.Number)) { winSec = 900; }
+        return avgHrInWindow(recEnd, recEnd + winSec);
     }
 
     function finishBg() as Void {
@@ -196,10 +341,13 @@ module Metrics {
         if (bgMode) { Storage.setValue(PENDING_QUEUE, pending); }
     }
 
-    // Queue fully sent: drop the saved copy and cancel the follow-up wake so no
-    // further background process spins up.
+    // Drain finished (queue empty): drop both persisted copies and cancel the
+    // follow-up wake so no further background process spins up. This is the single
+    // place pending_session is deleted, so the session survives every partial wake
+    // until its queue is fully accounted for.
     function clearDrainState() as Void {
         Storage.deleteValue(PENDING_QUEUE);
+        Storage.deleteValue(PENDING_SESSION);
         if ((Toybox has :Background) && (Background has :deleteTemporalEvent)) {
             try { Background.deleteTemporalEvent(); } catch (e) {}
         }
@@ -223,7 +371,12 @@ module Metrics {
     // built-in History renders the text state as a labeled timeline bar.
     function postMode(state as String, startIso as String, endIso as String) as Void {
         if (baseUrl() == null) { return; }
-        pending = [{
+        // Append rather than overwrite: clobbering the array would drop an in-flight
+        // POST (e.g. the start marker still draining when the end marker is queued).
+        // If a send is already in progress, onPost chains to this item; otherwise
+        // kick it off here.
+        var wasIdle = (pending.size() == 0);
+        pending.add({
             "path" => "/api/states/sensor.lullhum_session",
             "body" => {
                 "state" => state,
@@ -235,8 +388,8 @@ module Metrics {
                     "end" => endIso
                 }
             }
-        }];
-        sendNext();
+        });
+        if (wasIdle) { sendNext(); }
     }
 
     // Background fallback: close the mode bar (state = "idle") in case the live
@@ -276,15 +429,10 @@ module Metrics {
     }
 
     function sendNext() as Void {
-        if (pending.size() == 0) { finishBg(); return; }
         var url = baseUrl();
         var token = Application.Properties.getValue("haToken");
-        if (url == null || token == null) {
-            pending = [];
-            if (bgMode) { clearDrainState(); }
-            finishBg();
-            return;
-        }
+        if (url == null || token == null) { pending = []; } // unconfigured: nothing to send
+        if (pending.size() == 0) { finishDrain(); return; }
         var item = pending[0];
         var options = {
             :method => Communications.HTTP_REQUEST_METHOD_POST,
@@ -299,15 +447,55 @@ module Metrics {
     }
 
     function onPost(responseCode as Number, data as Null or Dictionary or String or PersistedContent.Iterator) as Void {
-        if (pending.size() > 0) { pending = pending.slice(1, null); }
-        saveQueue(); // checkpoint progress so a kill resumes from here, not the top
-        if (pending.size() == 0) {
-            if (mExitCb != null) { var cb = mExitCb; mExitCb = null; cb.invoke(); }
-            if (bgMode) { clearDrainState(); }
-            finishBg();
+        var path = headPath();
+        log("POST " + path + " -> " + responseCode);
+        var ok = (responseCode >= 200 && responseCode < 300);
+        var permanent = (responseCode >= 400 && responseCode < 500);
+
+        // Delivered, a permanent 4xx that retrying can't fix (drop so it can't wedge
+        // the queue), or a best-effort foreground marker — advance and keep draining.
+        if (ok || permanent || !bgMode) {
+            dropHead();
+            if (pending.size() == 0) { finishDrain(); } else { sendNext(); }
             return;
         }
-        sendNext();
+
+        // Transient background failure — no phone/BLE, server 5xx, relay timeout
+        // (CIQ reports these as negative codes). Keep the item for the armed retry
+        // wake rather than advancing (advancing here was the bug that silently lost
+        // every metric when the recovery wake couldn't reach HA), but give up on it
+        // after MAX_TRIES so one unreachable POST can't pin the queue forever.
+        if (pending.size() == 0) { finishDrain(); return; }
+        var item = pending[0];
+        var tries = (item.hasKey(TRIES_KEY) ? item.get(TRIES_KEY) : 0) + 1;
+        if (tries >= MAX_TRIES) {
+            log("dropping " + path + " after " + tries + " tries");
+            dropHead();
+        } else {
+            item.put(TRIES_KEY, tries);
+            saveQueue();
+        }
+        // Stop this wake; connectivity is likely down for the whole queue, so let
+        // the +5 min retry resume rather than hammer the rest now.
+        if (pending.size() == 0) { finishDrain(); } else { scheduleDrainRetry(); finishBg(); }
+    }
+
+    function headPath() as String {
+        return (pending.size() > 0) ? pending[0]["path"] : "?";
+    }
+
+    // Remove the head and checkpoint, so a killed wake resumes after it, not at it.
+    function dropHead() as Void {
+        if (pending.size() > 0) { pending = pending.slice(1, null); }
+        saveQueue();
+    }
+
+    // Queue fully accounted for: release a deferred app-exit, and in the background
+    // wipe the persisted state so no further wake spins up.
+    function finishDrain() as Void {
+        if (mExitCb != null) { var cb = mExitCb; mExitCb = null; cb.invoke(); }
+        if (bgMode) { clearDrainState(); }
+        finishBg();
     }
 
     // Invoke cb once the foreground send queue has drained (used to defer app
@@ -319,6 +507,13 @@ module Metrics {
     }
 
     // ---- Helpers -----------------------------------------------------------
+
+    // Diagnostic trace to the CIQ log (visible in the simulator and in device
+    // logs), prefixed so HA-delivery lines are easy to grep. Cheap and harmless in
+    // production; it's the only window into the background send, which has no UI.
+    function log(msg as String) as Void {
+        System.println("[Lullhum] " + msg);
+    }
 
     function configured() as Boolean {
         if (!(Communications has :makeWebRequest)) { return false; }

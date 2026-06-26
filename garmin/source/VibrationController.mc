@@ -172,6 +172,13 @@ class VibrationController {
                 new BreathPhase("Exhale", 8000, BREATHE_EXHALE),
                 new BreathPhase("Hold", 0, BREATHE_HOLD)
             ];
+        } else if (Config.presetIdx == Config.PRESET_BOX) {
+            raw = [
+                new BreathPhase("Inhale", 4000, BREATHE_INHALE),
+                new BreathPhase("Hold", 4000, BREATHE_HOLD),
+                new BreathPhase("Exhale", 4000, BREATHE_EXHALE),
+                new BreathPhase("Hold", 4000, BREATHE_HOLD)
+            ];
         } else {
             var c = Config.customMs;
             raw = [

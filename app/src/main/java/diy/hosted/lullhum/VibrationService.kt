@@ -49,7 +49,24 @@ class VibrationService : Service() {
         const val ACTION_STOP_REMINDER = "diy.hosted.lullhum.STOP_REMINDER"
         const val EXTRA_INTERVAL_MIN = "interval_min"
         const val MIN_REMINDER_MIN = 5
+
+        // Two-phone pair mode (watch-independent). Two phones, each set to Pair 1 or
+        // Pair 2, alternate buzzes by anchoring to the shared wall clock: Pair 1 on
+        // each whole second, Pair 2 half a second later. No BLE or messaging — they
+        // stay interleaved purely because both phones' clocks are network-synced and
+        // they re-anchor to the same absolute grid on every tick.
+        const val ACTION_START_PAIR = "diy.hosted.lullhum.START_PAIR"
+        const val ACTION_STOP_PAIR = "diy.hosted.lullhum.STOP_PAIR"
+        const val EXTRA_PAIR = "pair"
+        private const val PAIR_PERIOD_MS = 1000L
+        private const val PAIR_OFFSET_MS = 500L  // Pair 2's lead behind Pair 1
+        private const val PAIR_PULSE_MS = 250L   // leaves a clear gap inside the 500ms half
     }
+
+    // What the shared vibration timer is currently driving, so a watch event never
+    // tears down an independent pair session and vice versa.
+    private enum class TimerMode { NONE, WATCH, PAIR }
+    private var timerMode = TimerMode.NONE
 
     private lateinit var connectIQ: ConnectIQ
     private val iqApp = IQApp(IQ_APP_ID)
@@ -82,6 +99,8 @@ class VibrationService : Service() {
             ACTION_START_REMINDER ->
                 Reminder.start(this, intent.getIntExtra(EXTRA_INTERVAL_MIN, MIN_REMINDER_MIN))
             ACTION_STOP_REMINDER -> Reminder.stop(this)
+            ACTION_START_PAIR -> startPair(intent.getIntExtra(EXTRA_PAIR, 1))
+            ACTION_STOP_PAIR -> stopPair()
         }
         return START_STICKY
     }
@@ -91,7 +110,8 @@ class VibrationService : Service() {
     override fun onDestroy() {
         // Note: the reminder is intentionally NOT cancelled here — it's alarm-based
         // and meant to keep buzzing the watch even if this service is killed.
-        stopVibration()
+        cancelTimer()
+        timerMode = TimerMode.NONE
         unregisterDevices()
         if (sdkReady) {
             try {
@@ -148,11 +168,12 @@ class VibrationService : Service() {
 
         connectIQ.registerForDeviceEvents(device) { _, status ->
             if (status != IQDevice.IQDeviceStatus.CONNECTED) {
-                // Connection dropped: stop vibrating, but keep the service alive.
+                // Connection dropped: stop watch-driven vibration (a pair session is
+                // independent and keeps running), but keep the service alive.
                 stopVibration()
                 LullhumState.set(Status.DISCONNECTED)
             } else {
-                LullhumState.set(if (isVibrating()) Status.RUNNING else Status.STOPPED)
+                LullhumState.set(if (timerMode == TimerMode.WATCH) Status.RUNNING else Status.STOPPED)
             }
         }
 
@@ -196,10 +217,10 @@ class VibrationService : Service() {
 
     // ---- Vibration timer ---------------------------------------------------
 
-    private fun isVibrating() = vibrateRunnable != null
-
+    // Watch-driven alternation (started by a watch "start" message): the phone
+    // buzzes one interval behind the watch's shared anchor.
     private fun startVibration(speedMs: Int, anchorSec: Long) {
-        stopVibration()
+        takeOverTimer(TimerMode.WATCH)
         val period = 2L * speedMs
         // ~40% of one interval, clamped: leaves a silent gap of at least ~60% of
         // the interval before the watch's next buzz (vs. only ~50ms at Fast when
@@ -219,25 +240,83 @@ class VibrationService : Service() {
             System.currentTimeMillis() / 1000L
         }
 
-        // A foreground service keeps the process alive but lets the CPU suspend
-        // with the screen off; the Handler runs on uptimeMillis, which freezes
-        // during that suspend, so without this the timer stalls and desyncs.
         acquireWakeLock()
+        scheduleBuzz(pulse) { nextBuzzDelay(anchor, speedMs.toLong(), period) }
+        LullhumState.set(Status.RUNNING)
+        updateNotification()
+    }
 
+    // Watch stop (message or dropped connection). No-op when a pair session owns
+    // the timer, so the watch never tears down an independent two-phone session.
+    private fun stopVibration() {
+        if (timerMode != TimerMode.WATCH) return
+        cancelTimer()
+        timerMode = TimerMode.NONE
+        LullhumState.set(Status.STOPPED)
+        updateNotification()
+    }
+
+    // Two-phone pair mode (started by the user, watch-independent). Both phones
+    // anchor to the nearest whole second and re-anchor every tick; Pair 1 buzzes on
+    // each whole second, Pair 2 PAIR_OFFSET_MS later, so they interleave with no BLE
+    // or messaging as long as the two clocks agree (both phones use network time).
+    private fun startPair(pair: Int) {
+        val role = if (pair == 2) 2 else 1
+        takeOverTimer(TimerMode.PAIR)
+        val anchor = (System.currentTimeMillis() + 500L) / 1000L // round to nearest second
+        val offset = if (role == 2) PAIR_OFFSET_MS else 0L
+        acquireWakeLock()
+        scheduleBuzz(PAIR_PULSE_MS) { nextPairDelay(anchor, offset) }
+        LullhumState.setPair(active = true, role = role)
+        updateNotification()
+    }
+
+    private fun stopPair() {
+        if (timerMode != TimerMode.PAIR) return
+        cancelTimer()
+        timerMode = TimerMode.NONE
+        LullhumState.setPair(active = false, role = LullhumState.pairRole.value)
+        updateNotification()
+    }
+
+    // Cancel whatever's running and claim the timer for [mode], clearing the other
+    // feature's active state so only one shows as running at a time.
+    private fun takeOverTimer(mode: TimerMode) {
+        cancelTimer()
+        if (timerMode == TimerMode.PAIR && mode != TimerMode.PAIR) {
+            LullhumState.setPair(active = false, role = LullhumState.pairRole.value)
+        }
+        if (timerMode == TimerMode.WATCH && mode != TimerMode.WATCH &&
+            LullhumState.status.value == Status.RUNNING
+        ) {
+            LullhumState.set(Status.STOPPED)
+        }
+        timerMode = mode
+    }
+
+    // Schedule a self-rescheduling buzz: vibrate, then re-anchor to the wall clock
+    // via [delay] so a single late tick (after a brief CPU stall) self-corrects
+    // instead of drifting the rest of the session.
+    private fun scheduleBuzz(pulseMs: Long, delay: () -> Long) {
+        // A foreground service keeps the process alive but lets the CPU suspend with
+        // the screen off; the Handler runs on uptimeMillis, which freezes during
+        // that suspend, so the wake lock (acquired by the caller) keeps it ticking.
         val runnable = object : Runnable {
             override fun run() {
-                vibrateOnce(pulse)
-                // Re-anchor every tick to the shared wall clock so a single late
-                // buzz (e.g. after a brief CPU stall) self-corrects instead of
-                // drifting the rest of the session out of sync with the watch.
-                handler.postDelayed(this, nextBuzzDelay(anchor, speedMs.toLong(), period))
+                vibrateOnce(pulseMs)
+                handler.postDelayed(this, delay())
             }
         }
         vibrateRunnable = runnable
-        handler.postDelayed(runnable, nextBuzzDelay(anchor, speedMs.toLong(), period))
+        handler.postDelayed(runnable, delay())
+    }
 
-        LullhumState.set(Status.RUNNING)
-        updateNotification()
+    // Pure timer teardown — releases the wake lock and vibrator, no state changes.
+    private fun cancelTimer() {
+        vibrateRunnable?.let { handler.removeCallbacks(it) }
+        vibrateRunnable = null
+        vibrator.cancel()
+        releaseWakeLock()
     }
 
     // Phone buzzes one interval after the watch's anchor buzz, then every 2*speed.
@@ -251,13 +330,13 @@ class VibrationService : Service() {
         return next - now
     }
 
-    private fun stopVibration() {
-        vibrateRunnable?.let { handler.removeCallbacks(it) }
-        vibrateRunnable = null
-        vibrator.cancel()
-        releaseWakeLock()
-        LullhumState.set(Status.STOPPED)
-        updateNotification()
+    // Pair buzz: Pair 1 on the anchor grid (offset 0), Pair 2 PAIR_OFFSET_MS later,
+    // repeating every PAIR_PERIOD_MS; from any "now" pick the next slot ≥30ms out.
+    private fun nextPairDelay(anchorSec: Long, offset: Long): Long {
+        val now = System.currentTimeMillis()
+        var next = anchorSec * 1000L + offset
+        while (next < now + 30) next += PAIR_PERIOD_MS
+        return next - now
     }
 
     private fun acquireWakeLock() {
@@ -290,13 +369,19 @@ class VibrationService : Service() {
         )
     }
 
-    private fun buildNotification(): Notification =
-        Notification.Builder(this, CHANNEL_ID)
+    private fun buildNotification(): Notification {
+        val text = if (LullhumState.pairActive.value) {
+            "Pair ${LullhumState.pairRole.value} vibrating"
+        } else {
+            LullhumState.status.value.label
+        }
+        return Notification.Builder(this, CHANNEL_ID)
             .setContentTitle("Lullhum")
-            .setContentText(LullhumState.status.value.label)
+            .setContentText(text)
             .setSmallIcon(R.mipmap.ic_launcher)
             .setOngoing(true)
             .build()
+    }
 
     private fun updateNotification() {
         getSystemService(NotificationManager::class.java)

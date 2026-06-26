@@ -22,6 +22,14 @@ object LullhumState {
     private val _reminderIntervalMin = MutableStateFlow(15)
     val reminderIntervalMin: StateFlow<Int> = _reminderIntervalMin.asStateFlow()
 
+    // Two-phone pair mode: whether this phone is currently buzzing, and which side
+    // (1 or 2) it plays. Independent of the watch — see VibrationService.startPair.
+    private val _pairActive = MutableStateFlow(false)
+    val pairActive: StateFlow<Boolean> = _pairActive.asStateFlow()
+
+    private val _pairRole = MutableStateFlow(1)
+    val pairRole: StateFlow<Int> = _pairRole.asStateFlow()
+
     fun set(status: Status) {
         _status.value = status
     }
@@ -29,5 +37,10 @@ object LullhumState {
     fun setReminder(active: Boolean, intervalMin: Int) {
         _reminderActive.value = active
         _reminderIntervalMin.value = intervalMin
+    }
+
+    fun setPair(active: Boolean, role: Int) {
+        _pairActive.value = active
+        _pairRole.value = role
     }
 }

@@ -15,7 +15,7 @@ Foreground Simple App with three modes:
 | **Alternating** | yes | Watch and phone strictly alternate. To stay interleaved despite BLE latency, the watch picks the next whole wall-clock second as a shared anchor and sends `{cmd:"start", speed, anchor}`; both start there (watch on the anchor, phone one interval behind). Speed slow/medium/fast (1000/500/250 ms per side), duration 5/10/15/30 min or unlimited. Sends `{cmd:"stop"}` to end. If the phone drops, the watch keeps its own intervals. |
 | **Interval** | no | One `Attention.vibrate()` pulse every 2s…30min. Runs until stopped. |
 | **Longer Interval w/ Phone** | yes | One `Attention.vibrate()` pulse every 2s…30min. Also starts a background service that periodically sends a notification in the Android app. Runs until stopped. |
-| **Breathing** | no | At each stage change, plays a distinct binary on/off motif once (250 ms per slot) so the stages are easy to tell apart: inhale `-.-.`, exhale `--..`, holds `-..=`. Presets: **A** breathing sigh (2000/1000/0/8000/2000 ms), **B** 4-7-8 (4000/7000/8000/0 ms), **C** custom per-phase. |
+| **Breathing** | no | At each stage change, plays a distinct binary on/off motif once (250 ms per slot) so the stages are easy to tell apart: inhale `-.-.`, exhale `--..`, holds `-..=`. Presets: **A** breathing sigh (2000/1000/0/8000/2000 ms), **B** 4-7-8 (4000/7000/8000/0 ms), **C** box 4-4-4-4 (inhale/hold/exhale/hold, 4000 ms each), **D** custom per-phase. |
 
 ### Behaviour & controls
 
@@ -69,12 +69,29 @@ running):
 | `sensor.lullhum_hr_baseline` | mean HR over the N min **before** | bpm |
 | `sensor.lullhum_hr_recovery` | mean HR over the N min **after** | bpm |
 | `sensor.lullhum_hr_avg` | mean HR **during** | bpm |
+| `sensor.lullhum_hr_min` | lowest HR reached **during** (how deep it settled) | bpm |
 | `sensor.lullhum_duration` | session length | s |
+| `sensor.lullhum_stress_delta` | recovery − baseline stress (negative = settled) | — |
 | `sensor.lullhum_stress_baseline` / `_recovery` | Garmin stress before / after | — |
+| `sensor.lullhum_resp_delta` | recovery − baseline respiration | br/min |
 | `sensor.lullhum_resp_baseline` / `_recovery` | respiration before / after | br/min |
+| `sensor.lullhum_hrv_start` / `_avg` / `_end` | beat-to-beat HRV (RMSSD) over the first minute / whole session / last minute or two | ms |
 
 `hr_recovery_delta` is the headline: consistently negative across sessions is the
-signal the app is having an effect. `stress_*` / `resp_*` appear only when the
+signal the app is having an effect. `stress_delta` / `resp_delta` are the parallel
+deltas for the lower-noise markers, sent ahead of their raw before/after readings.
+
+**HRV (RMSSD).** Beat-to-beat HRV is the gold-standard parasympathetic marker, and a
+*rising* `hrv_start → hrv_end` across a session is the cleanest within-session signal
+of down-regulation. The platform has no HRV *history* API and the beat-to-beat R-R
+stream (`Sensor.registerSensorDataListener` with `:heartBeatIntervals`) only runs
+while the app is in the foreground, so there's no true *pre-session* or
+*post-recovery* HRV to read. Instead the live stream is windowed: `hrv_start` is the
+first minute (settling-in), `hrv_avg` the whole session, `hrv_end` roughly the last
+minute or two. They appear only on devices that deliver R-R intervals and only when
+enough beats were captured. (HR `hr_avg`/`hr_min` come from the 1 Hz HR events; if a
+device won't run those alongside the R-R stream, `hr_avg` falls back to the session
+window from history so the session still records — `hr_min` is then omitted.) `stress_*` / `resp_*` appear only when the
 device exposes those histories. Entities send most-important-first, so if the
 background run is cut short the headline ones still land.
 
@@ -103,20 +120,30 @@ windows are averages, not high-res curves — fine for trend deltas.
 > watch relays each POST through the phone over BLE). Instead the session is
 > persisted and all entities are sent from the **post-session background wake**
 > (~recovery-window minutes later). So a session appears in HA after that delay,
-> not the moment you finish. The background process has a ~30-second budget, which
-> is why the metric set is small and ordered most-important-first.
+> not the moment you finish.
+>
+> **Multi-pass, resumable send.** A background process has only a ~30-second
+> budget, so the queue may not drain in one wake. The remaining POSTs are persisted
+> (`pending_queue`) and the session record is kept until the queue is fully
+> accounted for, so each wake resumes where the last left off; cheap, always-present
+> metrics are queued first so the slow history reads can't block them. Every send
+> checks the HTTP response: a **2xx** advances; a transient failure (no phone/BLE,
+> 5xx, relay timeout) **keeps** the item and re-arms a +5 min wake to retry; a
+> permanent **4xx** (bad token/entity) drops just that item so it can't wedge the
+> rest. Each item is dropped after **8 failed attempts** so an unreachable POST
+> can't retry — and respawn wakes — forever. Response codes and any null
+> baseline/recovery reads are written to the CIQ log (`[Lullhum] …`) since the
+> background send has no UI.
 
 > **Note:** states set via the REST API aren't backed by an integration, so the
 > entities can't be attached to an HA **device** (only MQTT discovery / a custom
 > integration can do that), and they read `unknown` after a Home Assistant restart
 > until the next session repopulates them — recorded history is retained.
 
-> **More proxies worth adding later:** beat-to-beat **HRV (RMSSD)** is the gold
-> standard for parasympathetic tone but has limited in-app access on most
-> devices; **Body Battery** and **Pulse Ox** move too slowly to show a
-> within-session effect (better for day-level trends). The HR recovery delta,
-> stress, and respiration are the proxies that best distinguish genuine
-> relaxation from merely sitting still.
+> **More proxies worth adding later:** **Body Battery** and **Pulse Ox** move too
+> slowly to show a within-session effect (better for day-level trends). The HR
+> recovery delta, stress, respiration, and the within-session HRV trend are the
+> proxies that best distinguish genuine relaxation from merely sitting still.
 
 ### Build
 
@@ -140,11 +167,12 @@ Run in the simulator with `monkeydo bin/lullhum.prg venu3`, or sideload the
 
 ## Component 2 — Android companion (`app/`)
 
-Status indicator (Running / Connected / Waiting for watch) plus a background
-interval reminder. A foreground service (`VibrationService`) keeps the Connect IQ
-listener alive with a persistent notification, listens for watch messages, and on
-`start` vibrates on even intervals only (offset one full interval from the watch).
-On `stop` or a dropped connection it cancels the timer.
+Status indicator (Running / Connected / Waiting for watch), a background interval
+reminder, and a watch-independent **two-phone pairs** mode. A foreground service
+(`VibrationService`) keeps the Connect IQ listener alive with a persistent
+notification, listens for watch messages, and on `start` vibrates on even intervals
+only (offset one full interval from the watch). On `stop` or a dropped connection it
+cancels the timer.
 
 > **Locked-screen timing:** the alternating timer runs on the main looper, which
 > is paced by `uptimeMillis` and stops advancing once the CPU suspends — a
@@ -155,6 +183,23 @@ On `stop` or a dropped connection it cancels the timer.
 > off, **battery optimisation must be disabled for Lullhum** (Settings → Apps →
 > Lullhum → Battery → Unrestricted); aggressive OEM power management can otherwise
 > throttle the service or BLE and break sync.
+
+### Two-phone pairs (watch-independent)
+
+A way to get bilateral alternation from **two phones instead of a watch + phone**,
+with no BLE, pairing, or messaging. Set one phone to **Pair 1** and the other to
+**Pair 2** in the app, then press **Start** on both. Each phone anchors to the
+nearest whole second and buzzes off the shared wall clock: **Pair 1 on each whole
+second, Pair 2 half a second later** (`PAIR_OFFSET_MS`), so they interleave.
+
+There's no synchronisation channel — alignment relies solely on the two phones
+agreeing on the time, so **keep automatic (network) date & time on** for both.
+Because each phone re-anchors to the same absolute grid on every tick (Pair 1 on
+`…000` ms, Pair 2 on `…500` ms), they stay interleaved no matter when each was
+started, and a late tick self-corrects. It reuses the same foreground service,
+`PARTIAL_WAKE_LOCK`, and re-anchoring timer as the watch path, and is fully
+independent of it (a watch connecting/dropping never disturbs a pair session, and
+vice versa — whichever was started last owns the single vibration timer).
 
 ### Background reminder
 

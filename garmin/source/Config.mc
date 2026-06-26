@@ -6,7 +6,7 @@ using Toybox.Application.Storage;
 module Config {
 
     enum { MODE_ALTERNATING, MODE_INTERVAL, MODE_BREATHING }
-    enum { PRESET_SIGH, PRESET_478, PRESET_CUSTOM }
+    enum { PRESET_SIGH, PRESET_478, PRESET_BOX, PRESET_CUSTOM }
 
     var mode = MODE_ALTERNATING;
 
@@ -47,11 +47,11 @@ module Config {
 
     // --- Breathing: preset + custom phase durations [inhale1, inhale2, hold, exhale, hold2] ---
     var presetIdx = PRESET_SIGH;
-    var presetLabels as Array<String> = ["Phys. sigh", "4-7-8", "Custom"];
+    var presetLabels as Array<String> = ["Phys. sigh", "4-7-8", "Box 4-4-4-4", "Custom"];
     var customMs as Array<Number> = [2000, 1000, 0, 8000, 2000];
     var phaseOptions as Array<Number> = [0, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 10000];
 
-    function cyclePreset() as Void { presetIdx = (presetIdx + 1) % 3; }
+    function cyclePreset() as Void { presetIdx = (presetIdx + 1) % presetLabels.size(); }
     function presetLabel() as String { return presetLabels[presetIdx]; }
     function cycleCustomPhase(phase as Number) as Void {
         var idx = (phaseOptions.indexOf(customMs[phase]) + 1) % phaseOptions.size();
