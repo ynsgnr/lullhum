@@ -6,9 +6,14 @@ class LullhumApp extends Application.AppBase {
 
     hidden var mController as VibrationController?;
 
+    // Kept deliberately lean: this runs for the background recovery-push service
+    // too, whose memory budget is tiny. Loading the Config module here (with all
+    // its option arrays) blew that budget and crashed the service before
+    // getServiceDelegate() could run, so the recovery push never fired and no
+    // metrics reached HA. Config is foreground-only state, so it loads in
+    // getInitialView() instead.
     function initialize() {
         AppBase.initialize();
-        Config.load();
     }
 
     // Lazily created so the background service (recovery push) doesn't pull the
@@ -37,6 +42,7 @@ class LullhumApp extends Application.AppBase {
     // Launch straight into the running screen; it auto-starts with the saved
     // selection. Settings are reachable from there via the menu button.
     function getInitialView() {
+        Config.load();
         return [ new RunningView(), new RunningDelegate() ];
     }
 }

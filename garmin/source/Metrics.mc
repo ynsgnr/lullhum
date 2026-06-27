@@ -20,6 +20,13 @@ using Toybox.PersistedContent;
 // baseline -> during -> recovery; heart rate is the primary proxy, with Garmin's
 // HRV-derived stress and respiration as stronger parasympathetic markers.
 // Nothing is sent unless the HA URL + token are configured.
+// (:background) is REQUIRED: the recovery push (pushRecovery and everything it
+// calls) runs in the background temporal-event service. Without this annotation
+// the compiler leaves the whole module out of the background memory image, and
+// BackgroundService.onTemporalEvent faults ("Illegal Access (Out of Bounds) -
+// Failed invoking <symbol>") the instant it tries to call into Metrics, so no
+// session ever delivered its metrics. The foreground keeps full access too.
+(:background)
 module Metrics {
 
     // Sessions shorter than this are ignored (accidental starts / config churn).
