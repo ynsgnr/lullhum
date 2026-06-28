@@ -30,6 +30,13 @@ object LullhumState {
     private val _pairRole = MutableStateFlow(1)
     val pairRole: StateFlow<Int> = _pairRole.asStateFlow()
 
+    // Manual alternation calibration: a phase offset (ms) added to the phone's
+    // buzz slot so the user can centre it against the watch. Persisted via
+    // [Prefs]; this flow is the live in-memory copy the vibration timer reads on
+    // every buzz (so sliding it adjusts the felt timing immediately).
+    private val _calibrationTrimMs = MutableStateFlow(0)
+    val calibrationTrimMs: StateFlow<Int> = _calibrationTrimMs.asStateFlow()
+
     fun set(status: Status) {
         _status.value = status
     }
@@ -42,5 +49,9 @@ object LullhumState {
     fun setPair(active: Boolean, role: Int) {
         _pairActive.value = active
         _pairRole.value = role
+    }
+
+    fun setCalibration(trimMs: Int) {
+        _calibrationTrimMs.value = trimMs
     }
 }

@@ -89,6 +89,7 @@ class VibrationService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        LullhumState.setCalibration(Prefs.calibrationTrimMs(this))
         createNotificationChannel()
         initConnectIQ()
     }
@@ -325,7 +326,12 @@ class VibrationService : Service() {
     // The caller guarantees anchorSec > 0 (see startVibration).
     private fun nextBuzzDelay(anchorSec: Long, speedMs: Long, period: Long): Long {
         val now = System.currentTimeMillis()
-        var next = anchorSec * 1000L + speedMs
+        // Re-read the calibration trim every buzz so dragging the slider during a
+        // running session shifts the phone's phase live. It nudges the phone's slot
+        // earlier (negative) or later (positive) to absorb the residual watch/phone
+        // clock offset and per-device haptic latency the shared anchor can't.
+        val trim = LullhumState.calibrationTrimMs.value.toLong()
+        var next = anchorSec * 1000L + speedMs + trim
         while (next < now + 30) next += period
         return next - now
     }

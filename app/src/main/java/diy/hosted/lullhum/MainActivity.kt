@@ -31,7 +31,9 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -76,6 +78,10 @@ class MainActivity : ComponentActivity() {
             requestNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
 
+        // Seed the live trim from disk so the slider reflects the saved value even
+        // before the service (which also seeds it) finishes starting.
+        LullhumState.setCalibration(Prefs.calibrationTrimMs(this))
+
         ContextCompat.startForegroundService(this, Intent(this, VibrationService::class.java))
 
         setContent {
@@ -90,7 +96,9 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 fun StatusScreen(modifier: Modifier = Modifier) {
+    val ctx = LocalContext.current
     val status by LullhumState.status.collectAsState()
+    var showDescriptions by remember { mutableStateOf(Prefs.showDescriptions(ctx)) }
 
     Column(
         modifier = modifier
@@ -100,19 +108,37 @@ fun StatusScreen(modifier: Modifier = Modifier) {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Lullhum", fontSize = 28.sp, fontWeight = FontWeight.Bold)
-            Spacer(Modifier.width(10.dp))
-            Box(Modifier.size(12.dp).clip(CircleShape).background(statusColor(status)))
+        Box(Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier.align(Alignment.Center),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Lullhum", fontSize = 28.sp, fontWeight = FontWeight.Bold)
+                Spacer(Modifier.width(10.dp))
+                Box(Modifier.size(12.dp).clip(CircleShape).background(statusColor(status)))
+            }
+            TextButton(
+                onClick = {
+                    showDescriptions = !showDescriptions
+                    Prefs.setShowDescriptions(ctx, showDescriptions)
+                },
+                modifier = Modifier.align(Alignment.CenterEnd)
+            ) {
+                Text(if (showDescriptions) "Show less" else "Show more", fontSize = 12.sp)
+            }
         }
         Spacer(Modifier.height(32.dp))
         HorizontalDivider()
         Spacer(Modifier.height(24.dp))
-        ReminderControls()
+        PairControls(showDescriptions)
         Spacer(Modifier.height(24.dp))
         HorizontalDivider()
         Spacer(Modifier.height(24.dp))
-        PairControls()
+        ReminderControls(showDescriptions)
+        Spacer(Modifier.height(24.dp))
+        HorizontalDivider()
+        Spacer(Modifier.height(24.dp))
+        CalibrationControls(showDescriptions)
     }
 }
 
@@ -124,7 +150,7 @@ private fun statusColor(status: Status): Color = when (status) {
 }
 
 @Composable
-private fun ReminderControls() {
+private fun ReminderControls(showDescriptions: Boolean) {
     val ctx = LocalContext.current
     val active by LullhumState.reminderActive.collectAsState()
     val intervalMin by LullhumState.reminderIntervalMin.collectAsState()
@@ -132,14 +158,16 @@ private fun ReminderControls() {
 
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Text("Background reminder", fontSize = 18.sp, fontWeight = FontWeight.Medium)
-        Spacer(Modifier.height(6.dp))
-        Text(
-            "To buzz the watch: enable notifications and turn off Do Not Disturb on both watch and phone. " +
-                "For correct timing while locked, also disable battery optimisation for Lullhum.",
-            fontSize = 12.sp,
-            color = StatusGrey,
-            textAlign = TextAlign.Center
-        )
+        if (showDescriptions) {
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "To buzz the watch: enable notifications and turn off Do Not Disturb on both watch and phone. " +
+                    "For correct timing while locked, also disable battery optimisation for Lullhum.",
+                fontSize = 12.sp,
+                color = StatusGrey,
+                textAlign = TextAlign.Center
+            )
+        }
         Spacer(Modifier.height(12.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             REMINDER_PRESETS.forEach { min ->
@@ -197,12 +225,69 @@ private fun sendReminder(ctx: Context, action: String, intervalMin: Int = 0) {
 }
 
 /**
+ * One-time manual calibration for watch alternation. The shared wall-clock anchor
+ * keeps watch and phone interleaved, but a residual clock offset / haptic latency
+ * can leave them feeling uneven ("two buzzes then a pause"). This slider trims the
+ * phone's phase to centre it; it's saved once and applied live (see
+ * [VibrationService.nextBuzzDelay]).
+ */
+@Composable
+private fun CalibrationControls(showDescriptions: Boolean) {
+    val ctx = LocalContext.current
+    val trim by LullhumState.calibrationTrimMs.collectAsState()
+
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text("Alternation calibration", fontSize = 18.sp, fontWeight = FontWeight.Medium)
+        if (showDescriptions) {
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "Optional. If the watch and phone buzzes feel uneven — like two buzzes then a pause " +
+                    "instead of a steady back-and-forth — nudge this until they feel evenly spaced. " +
+                    "Best done while a watch session is running so you feel the change live. Saved once.",
+                fontSize = 12.sp,
+                color = StatusGrey,
+                textAlign = TextAlign.Center
+            )
+        }
+        Spacer(Modifier.height(12.dp))
+        Text(
+            "${if (trim > 0) "+" else ""}$trim ms",
+            fontSize = 16.sp,
+            fontWeight = FontWeight.Medium
+        )
+        Slider(
+            value = trim.toFloat(),
+            onValueChange = {
+                val v = it.toInt()
+                Prefs.setCalibrationTrimMs(ctx, v)
+                LullhumState.setCalibration(v)
+            },
+            valueRange = -Prefs.CALIBRATION_TRIM_MAX.toFloat()..Prefs.CALIBRATION_TRIM_MAX.toFloat(),
+            modifier = Modifier.fillMaxWidth()
+        )
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+            Text("Phone earlier", fontSize = 11.sp, color = StatusGrey)
+            Text("Phone later", fontSize = 11.sp, color = StatusGrey)
+        }
+        if (trim != 0) {
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(onClick = {
+                Prefs.setCalibrationTrimMs(ctx, 0)
+                LullhumState.setCalibration(0)
+            }) {
+                Text("Reset to centre")
+            }
+        }
+    }
+}
+
+/**
  * Two-phone alternating: set one phone to Pair 1 and another to Pair 2, press Start
  * on both, and they buzz in alternation off the shared wall clock — no watch, BLE,
  * or pairing involved (see [VibrationService.startPair]).
  */
 @Composable
-private fun PairControls() {
+private fun PairControls(showDescriptions: Boolean) {
     val ctx = LocalContext.current
     val active by LullhumState.pairActive.collectAsState()
     val activeRole by LullhumState.pairRole.collectAsState()
@@ -211,15 +296,17 @@ private fun PairControls() {
 
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Text("Two-phone pairs", fontSize = 18.sp, fontWeight = FontWeight.Medium)
-        Spacer(Modifier.height(6.dp))
-        Text(
-            "Use two phones instead of a watch. Set one to Pair 1 and the other to Pair 2, then " +
-                "press Start on both — they alternate (Pair 1, then Pair 2 half a second later). No " +
-                "pairing needed; alignment relies on both phones' clocks, so keep automatic date & time on.",
-            fontSize = 12.sp,
-            color = StatusGrey,
-            textAlign = TextAlign.Center
-        )
+        if (showDescriptions) {
+            Spacer(Modifier.height(6.dp))
+            Text(
+                "Use two phones instead of a watch. Set one to Pair 1 and the other to Pair 2, then " +
+                    "press Start on both — they alternate (Pair 1, then Pair 2 half a second later). No " +
+                    "pairing needed; alignment relies on both phones' clocks, so keep automatic date & time on.",
+                fontSize = 12.sp,
+                color = StatusGrey,
+                textAlign = TextAlign.Center
+            )
+        }
         Spacer(Modifier.height(12.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             PairChip("Pair 1", selected = shownRole == 1, enabled = !active) { role = 1 }
